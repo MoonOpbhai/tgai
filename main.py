@@ -29,7 +29,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NVIDIA_API_KEY     = os.getenv("NVIDIA_API_KEY", "").strip()
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-
 DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 DB_FILE = "memory.db"
@@ -37,7 +36,7 @@ DB_FILE = "memory.db"
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     raise SystemExit("Missing API keys")
 
-# ───────────────── DATABASE MEMORY ───────────────── #
+# ───────────────── DATABASE ───────────────── #
 
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
@@ -75,12 +74,12 @@ def clear_memory(chat_id):
 # ───────────────── STATE ───────────────── #
 
 user_model = defaultdict(lambda: DEFAULT_MODEL)
-user_locks = defaultdict(asyncio.Lock)
+user_lock = defaultdict(asyncio.Lock)
 user_stop = set()
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 
-# ───────────────── STREAM AI ───────────────── #
+# ───────────────── FIXED STREAM (IMPORTANT PART) ───────────────── #
 
 def stream_ai(messages, model):
     payload = {
@@ -98,44 +97,57 @@ def stream_ai(messages, model):
 
     try:
         with requests.post(API_URL, json=payload, headers=headers,
-                           stream=True, timeout=90) as r:
+                           stream=True, timeout=120) as r:
 
             if r.status_code != 200:
-                yield f"API Error {r.status_code}"
+                yield f"API Error {r.status_code}: {r.text}"
                 return
 
-            for line in r.iter_lines():
-                if not line:
+            buffer = ""
+
+            for chunk in r.iter_content(chunk_size=1024):
+                if not chunk:
                     continue
 
-                try:
-                    line = line.decode().replace("data: ", "")
+                text = chunk.decode("utf-8", errors="ignore")
+                buffer += text
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+
+                    if not line:
+                        continue
+
+                    if "data:" in line:
+                        line = line.replace("data: ", "").strip()
+
                     if line == "[DONE]":
                         return
 
-                    data = json.loads(line)
-                    delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-
-                    if delta:
-                        yield delta
-
-                except:
-                    continue
+                    try:
+                        data = json.loads(line)
+                        delta = data["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            yield delta
+                    except:
+                        continue
 
     except Exception as e:
-        yield f"Error: {e}"
+        yield f"Stream Error: {e}"
 
-# ───────────────── BUILD MESSAGES ───────────────── #
+# ───────────────── HELPERS ───────────────── #
 
-def build_messages(chat_id):
+def build_messages(chat_id, text):
     history = get_history(chat_id)
 
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        *history
-    ]
+    return (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + history
+        + [{"role": "user", "content": text}]
+    )
 
-# ───────────────── START ───────────────── #
+# ───────────────── COMMANDS ───────────────── #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -145,20 +157,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stop"
     )
 
-# ───────────────── STOP ───────────────── #
-
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_stop.add(update.effective_chat.id)
     await update.message.reply_text("🛑 Stopped")
-
-# ───────────────── CLEAR MEMORY ───────────────── #
 
 async def clearmem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     clear_memory(chat_id)
     await update.message.reply_text("🗑️ Memory cleared")
-
-# ───────────────── SET MODEL (FIXED) ───────────────── #
 
 async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -178,20 +184,17 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
-    if user_locks[chat_id].locked():
+    if user_lock[chat_id].locked():
         await update.message.reply_text("⏳ Wait...")
         return
 
-    async with user_locks[chat_id]:
+    async with user_lock[chat_id]:
 
         sent = await update.message.reply_text("⏳ thinking...")
 
         model = user_model[chat_id]
 
-        messages = build_messages(chat_id)
-
-        # add current user message only for API
-        messages.append({"role": "user", "content": text})
+        messages = build_messages(chat_id, text)
 
         buffer = ""
         last_update = time.time()
@@ -212,9 +215,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             buffer += chunk
 
-            if time.time() - last_update > 0.6:
+            if time.time() - last_update > 0.5:
                 try:
-                    await sent.edit_text(buffer[:4000])
+                    await sent.edit_text(buffer[-4000:])
                 except:
                     pass
                 last_update = time.time()
@@ -263,7 +266,7 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    logger.info("Bot running...")
+    logger.info("Bot running fixed version...")
     await asyncio.Event().wait()
 
 # ───────────────── ENTRY ───────────────── #
