@@ -29,7 +29,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NVIDIA_API_KEY     = os.getenv("NVIDIA_API_KEY", "").strip()
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-DEFAULT_MODEL = "moonshotai/kimi-k2-thinking"
+DEFAULT_MODEL = "moonshotai/kimi-k2-instruct"
 
 DB_FILE = "memory.db"
 
@@ -79,7 +79,7 @@ user_stop  = set()
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 
-# ───────────────── 🔥 FIXED SSE STREAM ───────────────── #
+# ───────────────── 🔥 FIXED SSE STREAM (RAW SAFE) ───────────────── #
 
 def stream_ai(messages, model):
     payload = {
@@ -108,40 +108,50 @@ def stream_ai(messages, model):
                 yield f"API Error: {r.text}"
                 return
 
-            for line in r.iter_lines(decode_unicode=True):
+            buffer = ""
 
-                if not line:
+            for chunk in r.iter_content(chunk_size=1024, decode_unicode=True):
+
+                if not chunk:
                     continue
 
-                line = line.strip()
+                buffer += chunk
 
-                # remove SSE prefix
-                if line.startswith("data:"):
-                    line = line[5:].strip()
+                # process line-by-line safely
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
 
-                if line == "[DONE]":
-                    return
-
-                try:
-                    data = json.loads(line)
-
-                    choices = data.get("choices", [])
-                    if not choices:
+                    if not line:
                         continue
 
-                    delta = choices[0].get("delta", {})
-                    content = delta.get("content", "")
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
 
-                    if content:
-                        yield content
+                    if line == "[DONE]":
+                        return
 
-                except json.JSONDecodeError:
-                    continue
+                    try:
+                        data = json.loads(line)
+
+                        choices = data.get("choices", [])
+                        if not choices:
+                            continue
+
+                        delta = choices[0].get("delta", {})
+                        content = delta.get("content")
+
+                        # IMPORTANT: RAW OUTPUT ONLY
+                        if content is not None:
+                            yield content
+
+                    except json.JSONDecodeError:
+                        continue
 
     except Exception as e:
         yield f"Stream Error: {e}"
 
-# ───────────────── BUILD MESSAGES ───────────────── #
+# ───────────────── BUILD MESSAGE ───────────────── #
 
 def build_messages(chat_id, text):
     history = get_history(chat_id)
@@ -240,7 +250,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_msg(chat_id, "user", text)
         save_msg(chat_id, "assistant", final)
 
-# ───────────────── WEB SERVER (RENDER FIX) ───────────────── #
+# ───────────────── WEB SERVER (RENDER SAFE) ───────────────── #
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -255,7 +265,7 @@ def run_web():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-# ───────────────── BOT RUN ───────────────── #
+# ───────────────── BOT START ───────────────── #
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -270,7 +280,7 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    logger.info("Bot running (FIXED SSE STREAM)...")
+    logger.info("Bot running stable version...")
     await asyncio.Event().wait()
 
 # ───────────────── ENTRY ───────────────── #
