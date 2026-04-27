@@ -29,20 +29,20 @@ if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     print("❌ Missing ENV variables")
     exit(1)
 
-# ---------------- STOP CONTROL ---------------- #
+# ---------------- CONTROL ---------------- #
 
+active_chat = None
+lock = asyncio.Lock()
 user_stop = set()
 
-# ---------------- SYSTEM PROMPT (AGENT MODE) ---------------- #
+# ---------------- AGENT PROMPT ---------------- #
 
 SYSTEM_PROMPT = """
 You are an autonomous AI agent.
 
-Rules:
 - Think step by step internally
-- Break tasks into logic if needed
-- Be smart, concise, and helpful
-- Act like a reasoning assistant, not a dumb chatbot
+- Be concise and intelligent
+- Act like reasoning assistant
 """
 
 # ---------------- MODELS ---------------- #
@@ -108,17 +108,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = context.user_data.get("model", DEFAULT_MODEL)
 
     await update.message.reply_text(
-        f"🤖 Agent Bot Ready\n\n"
-        f"🧠 Model:\n{model}\n\n"
-        "/models - list\n"
-        "/setmodel - change\n"
-        "/current - show\n"
-        "/stop - stop response"
+        f"🤖 Agent Bot Ready\n\n🧠 Model:\n{model}\n\n"
+        "/models\n/setmodel\n/current\n/stop"
     )
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_stop.add(update.effective_chat.id)
-    await update.message.reply_text("🛑 Stopped current response")
+    await update.message.reply_text("🛑 Stopping current response...")
 
 async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ loading models...")
@@ -149,50 +145,60 @@ async def current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = context.user_data.get("model", DEFAULT_MODEL)
     await update.message.reply_text(f"🧠 Current Model:\n{model}")
 
-# ---------------- CHAT (FAST + STOP + STREAM) ---------------- #
+# ---------------- MAIN CHAT (FIXED) ---------------- #
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    global active_chat
 
-    # reset stop flag
+    chat_id = update.effective_chat.id
+    user_text = update.message.text
+
+    # STOP previous request flag reset
     user_stop.discard(chat_id)
 
-    user_text = update.message.text
-    model = context.user_data.get("model", DEFAULT_MODEL)
+    # ❌ BLOCK if another chat running
+    if active_chat is not None and active_chat != chat_id:
+        await update.message.reply_text("⏳ Bot busy, wait...")
+        return
 
-    sent = await update.message.reply_text("⏳ thinking...")
+    async with lock:
+        active_chat = chat_id
 
-    full_text = ""
-    last_update = 0
-    UPDATE_DELAY = 0.7  # FAST + safe
+        try:
+            model = context.user_data.get("model", DEFAULT_MODEL)
 
-    def run_stream():
-        return list(stream_nvidia(user_text, model))
+            sent = await update.message.reply_text("⏳ thinking...")
 
-    loop = asyncio.get_event_loop()
-    chunks = await loop.run_in_executor(None, run_stream)
+            buffer = ""
+            last_update = 0
+            UPDATE_DELAY = 0.2  # FAST + stable
 
-    for chunk in chunks:
+            def run_stream():
+                return list(stream_nvidia(user_text, model))
 
-        # STOP CHECK
-        if chat_id in user_stop:
-            await sent.edit_text("🛑 Stopped")
-            return
+            loop = asyncio.get_event_loop()
+            chunks = await loop.run_in_executor(None, run_stream)
 
-        full_text += chunk
+            for chunk in chunks:
 
-        # FAST UPDATE CONTROL
-        if time.time() - last_update > UPDATE_DELAY:
-            try:
-                await sent.edit_text(full_text + " ▌")
-            except:
-                pass
-            last_update = time.time()
+                # STOP check
+                if chat_id in user_stop:
+                    await sent.edit_text("🛑 Stopped")
+                    return
 
-    try:
-        await sent.edit_text(full_text)
-    except:
-        pass
+                buffer += chunk
+
+                if time.time() - last_update > UPDATE_DELAY:
+                    try:
+                        await sent.edit_text(buffer + " ▌")
+                    except:
+                        pass
+                    last_update = time.time()
+
+            await sent.edit_text(buffer)
+
+        finally:
+            active_chat = None
 
 # ---------------- WEB SERVER ---------------- #
 
@@ -206,7 +212,7 @@ def run_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-# ---------------- RUN BOT ---------------- #
+# ---------------- RUN ---------------- #
 
 async def run_bot():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -222,7 +228,7 @@ async def run_bot():
     await app.start()
     await app.updater.start_polling()
 
-    print("🤖 Agent Bot Running...")
+    print("🤖 Stable Agent Bot Running...")
 
     await asyncio.Event().wait()
 
