@@ -11,13 +11,15 @@ from telegram.ext import (
     filters,
 )
 
+# ---------------------------------------- #
 # 🔐 ENV
+# ---------------------------------------- #
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
-
 DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
 
 # ---------------------------------------- #
@@ -51,19 +53,24 @@ agent = HermesAgent()
 app = Flask(__name__)
 
 # ---------------------------------------- #
-# 🤖 Telegram Application (built once)
+# 🤖 Telegram — Lazy Init
 # ---------------------------------------- #
 
-ptb_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+_ptb_app = None
 _ptb_initialized = False
 
 
-async def ensure_initialized():
-    """Initialize PTB app only once."""
-    global _ptb_initialized
-    if not _ptb_initialized:
-        await ptb_app.initialize()
-        _ptb_initialized = True
+def get_ptb_app():
+    global _ptb_app
+    if _ptb_app is None:
+        _ptb_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        _ptb_app.add_handler(CommandHandler("start", start))
+        _ptb_app.add_handler(CommandHandler("models", list_models))
+        _ptb_app.add_handler(CommandHandler("setmodel", set_model))
+        _ptb_app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        )
+    return _ptb_app
 
 # ---------------------------------------- #
 # 🌐 NVIDIA Helpers
@@ -107,7 +114,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Bot ready!\n\n"
         "/models → list models\n"
-        "/setmodel <name> → change model\n"
+        "/setmodel <n> → change model\n"
         "Try: calculate 5*10"
     )
 
@@ -117,7 +124,6 @@ async def list_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not models:
         await update.message.reply_text("No models found.")
         return
-
     text = "📦 Available Models:\n\n"
     for m in models[:30]:
         text += f"• {m}\n"
@@ -129,28 +135,24 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /setmodel <model_name>")
         return
-    model_name = context.args[0]
-    context.user_data["model"] = model_name
-    await update.message.reply_text(f"✅ Model set to:\n{model_name}")
+    context.user_data["model"] = context.args[0]
+    await update.message.reply_text(f"✅ Model set to:\n{context.args[0]}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
-    # 🧠 Tool check
     tool_result = agent.think(user_text)
     if tool_result:
         await update.message.reply_text(f"🧮 {tool_result}")
         return
 
-    # 💾 Conversation history
     if "history" not in context.user_data:
         context.user_data["history"] = [
             {"role": "system", "content": "You are a helpful AI assistant."}
         ]
 
     context.user_data["history"].append({"role": "user", "content": user_text})
-    # Keep last 10 messages + system prompt
     history = context.user_data["history"]
     if len(history) > 11:
         context.user_data["history"] = [history[0]] + history[-10:]
@@ -162,15 +164,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 # ---------------------------------------- #
-# Register handlers
-# ---------------------------------------- #
-
-ptb_app.add_handler(CommandHandler("start", start))
-ptb_app.add_handler(CommandHandler("models", list_models))
-ptb_app.add_handler(CommandHandler("setmodel", set_model))
-ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-# ---------------------------------------- #
 # 🔗 Flask Routes
 # ---------------------------------------- #
 
@@ -179,21 +172,19 @@ def home():
     return "Bot is running!", 200
 
 
-@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Flask route is sync — we run the async PTB processing
-    inside a new event loop (safe for Render's threaded gunicorn).
-    """
     try:
         data = request.get_json(force=True)
         if not data:
             return "bad request", 400
 
+        ptb = get_ptb_app()
+
         async def process():
-            await ensure_initialized()
-            update = Update.de_json(data, ptb_app.bot)
-            await ptb_app.process_update(update)
+            await ptb.initialize()
+            update = Update.de_json(data, ptb.bot)
+            await ptb.process_update(update)
 
         asyncio.run(process())
 
@@ -202,8 +193,9 @@ def webhook():
 
     return "ok", 200
 
+
 # ---------------------------------------- #
-# ▶️  Entry point (local dev only)
+# ▶️  Entry point
 # ---------------------------------------- #
 
 if __name__ == "__main__":
