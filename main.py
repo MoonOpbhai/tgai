@@ -30,7 +30,7 @@ NVIDIA_API_KEY     = os.getenv("NVIDIA_API_KEY", "").strip()
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-DEFAULT_MODEL = "moonshotai/kimi-k2-instruct"
+DEFAULT_MODEL = "z-ai/glm-5.1"
 
 DB_FILE = "memory.db"
 
