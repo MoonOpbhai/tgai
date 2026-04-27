@@ -4,236 +4,271 @@ import threading
 import time
 import json
 import requests
+import logging
+from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update
+from telegram import Update, constants
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
 )
 
-# ---------------- CONFIG ---------------- #
+# ───────────────────────── LOGGING ───────────────────────── #
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("AgentBot")
+
+# ───────────────────────── CONFIG ───────────────────────── #
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+NVIDIA_API_KEY     = os.getenv("NVIDIA_API_KEY", "").strip()
 
-API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+API_URL    = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 
 DEFAULT_MODEL = "stepfun-ai/step-3.5-flash"
 
+MAX_HISTORY = 15
+STREAM_TIMEOUT = 90
+UPDATE_INTERVAL = 0.35
+RATE_LIMIT = 10
+RATE_WINDOW = 60
+
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
-    print("❌ Missing ENV variables")
-    exit(1)
+    raise SystemExit("Missing API keys")
 
-# ---------------- CONTROL ---------------- #
+# ───────────────────────── STATE ───────────────────────── #
 
-active_chat = None
-lock = asyncio.Lock()
+conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+user_locks = defaultdict(asyncio.Lock)
 user_stop = set()
+rate_tracker = defaultdict(lambda: deque(maxlen=RATE_LIMIT))
 
-# ---------------- AGENT PROMPT ---------------- #
+user_profile = defaultdict(dict)
+user_tone = defaultdict(lambda: "friendly")
+user_persona = defaultdict(lambda: "default")
 
-SYSTEM_PROMPT = """
-You are an autonomous AI agent.
+PERSONAS = {
+    "default": "You are a helpful intelligent AI assistant.",
+    "jarvis": "You are JARVIS from Iron Man: calm, precise, genius-level assistant.",
+    "teacher": "You explain everything like a great teacher.",
+    "coder": "You are a senior software engineer writing production code."
+}
 
-- Think step by step internally
-- Be concise and intelligent
-- Act like reasoning assistant
+# ───────────────────────── RATE LIMIT ───────────────────────── #
+
+def is_rate_limited(chat_id):
+    now = time.time()
+    dq = rate_tracker[chat_id]
+
+    while dq and now - dq[0] > RATE_WINDOW:
+        dq.popleft()
+
+    if len(dq) >= RATE_LIMIT:
+        return True
+
+    dq.append(now)
+    return False
+
+# ───────────────────────── PROMPT ───────────────────────── #
+
+def build_prompt(chat_id):
+    name = user_profile[chat_id].get("name", "")
+    tone = user_tone[chat_id]
+    persona = PERSONAS.get(user_persona[chat_id], PERSONAS["default"])
+
+    return f"""
+{persona}
+
+STYLE:
+- Tone: {tone}
+- Natural human-like responses
+
+RULES:
+- Be accurate
+- No hallucination
+- Be structured and clear
+
+MEMORY:
+User name: {name if name else "unknown"}
 """
 
-# ---------------- MODELS ---------------- #
+# ───────────────────────── STREAM AI ───────────────────────── #
 
-def get_models():
-    headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}"}
+def stream_ai(messages, model):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.6,
+        "max_tokens": 1000,
+        "stream": True,
+    }
 
-    try:
-        res = requests.get(MODELS_URL, headers=headers, timeout=20)
-        if res.status_code != 200:
-            return []
-        return [m["id"] for m in res.json().get("data", []) if "id" in m]
-    except:
-        return []
-
-# ---------------- NVIDIA STREAM ---------------- #
-
-def stream_nvidia(user_text, model):
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
     }
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}
-        ],
-        "temperature": 0.6,
-        "max_tokens": 800,
-        "stream": True
-    }
+    try:
+        with requests.post(API_URL, json=payload, headers=headers,
+                           stream=True, timeout=STREAM_TIMEOUT) as r:
 
-    with requests.post(API_URL, headers=headers, json=payload, stream=True, timeout=60) as res:
-        if res.status_code != 200:
-            yield f"API Error {res.status_code}"
-            return
+            if r.status_code != 200:
+                yield f"API Error {r.status_code}"
+                return
 
-        for line in res.iter_lines():
-            if not line:
-                continue
+            for line in r.iter_lines():
+                if not line:
+                    continue
 
-            line = line.decode("utf-8")
+                line = line.decode().replace("data: ", "")
 
-            if line.startswith("data: "):
-                line = line[6:]
+                if line == "[DONE]":
+                    return
 
-            if line == "[DONE]":
-                break
+                try:
+                    delta = json.loads(line)["choices"][0]["delta"].get("content", "")
+                    if delta:
+                        yield delta
+                except:
+                    continue
 
-            try:
-                chunk = json.loads(line)
-                delta = chunk["choices"][0]["delta"].get("content", "")
-                if delta:
-                    yield delta
-            except:
-                continue
+    except Exception as e:
+        yield f"Error: {e}"
 
-# ---------------- COMMANDS ---------------- #
+# ───────────────────────── HELPERS ───────────────────────── #
+
+def build_messages(chat_id, text, model):
+    history = list(conversation_history[chat_id])
+
+    return (
+        [{"role": "system", "content": build_prompt(chat_id)}]
+        + history
+        + [{"role": "user", "content": text}]
+    )
+
+def save(chat_id, user_text, bot_text):
+    conversation_history[chat_id].append({"role": "user", "content": user_text})
+    conversation_history[chat_id].append({"role": "assistant", "content": bot_text})
+
+# ───────────────────────── COMMANDS ───────────────────────── #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    model = context.user_data.get("model", DEFAULT_MODEL)
-
-    await update.message.reply_text(
-        f"🤖 Agent Bot Ready\n\n🧠 Model:\n{model}\n\n"
-        "/models\n/setmodel\n/current\n/stop"
-    )
+    await update.message.reply_text("🤖 Full Agent Bot Online")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_stop.add(update.effective_chat.id)
-    await update.message.reply_text("🛑 Stopping current response...")
+    await update.message.reply_text("🛑 Stopping response...")
 
-async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ loading models...")
-
-    models_list = get_models()
-
-    if not models_list:
-        await update.message.reply_text("❌ No models found")
+async def persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("jarvis / teacher / coder / default")
         return
+    user_persona[update.effective_chat.id] = context.args[0]
+    await update.message.reply_text("🧠 Persona updated")
 
-    text = "📦 Models:\n\n"
-    for i, m in enumerate(models_list[:40]):
-        text += f"{i+1}. {m}\n"
+async def tone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("friendly / formal / casual")
+        return
+    user_tone[update.effective_chat.id] = " ".join(context.args)
+    await update.message.reply_text("🎭 Tone updated")
 
-    await update.message.reply_text(text)
-
-async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /setmodel <name>")
         return
+    context.user_data["model"] = " ".join(context.args)
+    await update.message.reply_text("✅ Model changed")
 
-    model = " ".join(context.args)
-    context.user_data["model"] = model
+# ───────────────────────── MAIN CHAT ───────────────────────── #
 
-    await update.message.reply_text(f"✅ Model set:\n{model}")
-
-async def current(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    model = context.user_data.get("model", DEFAULT_MODEL)
-    await update.message.reply_text(f"🧠 Current Model:\n{model}")
-
-# ---------------- MAIN CHAT (FIXED) ---------------- #
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_chat
-
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_text = update.message.text
+    text = update.message.text.strip()
+    model = context.user_data.get("model", DEFAULT_MODEL)
 
-    # STOP previous request flag reset
-    user_stop.discard(chat_id)
+    # learning name
+    if "my name is" in text.lower():
+        user_profile[chat_id]["name"] = text.split("is")[-1].strip()
 
-    # ❌ BLOCK if another chat running
-    if active_chat is not None and active_chat != chat_id:
-        await update.message.reply_text("⏳ Bot busy, wait...")
+    # rate limit
+    if is_rate_limited(chat_id):
+        await update.message.reply_text("⏱️ Slow down please")
         return
 
-    async with lock:
-        active_chat = chat_id
+    # lock
+    if user_locks[chat_id].locked():
+        await update.message.reply_text("⏳ Wait, I am still replying...")
+        return
 
-        try:
-            model = context.user_data.get("model", DEFAULT_MODEL)
+    async with user_locks[chat_id]:
 
-            sent = await update.message.reply_text("⏳ thinking...")
+        sent = await update.message.reply_text("⏳ thinking...")
 
-            buffer = ""
-            last_update = 0
-            UPDATE_DELAY = 0.2  # FAST + stable
+        messages = build_messages(chat_id, text, model)
 
-            def run_stream():
-                return list(stream_nvidia(user_text, model))
+        buffer = ""
+        last = time.time()
 
-            loop = asyncio.get_event_loop()
-            chunks = await loop.run_in_executor(None, run_stream)
+        loop = asyncio.get_event_loop()
+        chunks = await loop.run_in_executor(
+            None, lambda: list(stream_ai(messages, model))
+        )
 
-            for chunk in chunks:
+        for c in chunks:
 
-                # STOP check
-                if chat_id in user_stop:
-                    await sent.edit_text("🛑 Stopped")
-                    return
+            if chat_id in user_stop:
+                user_stop.discard(chat_id)
+                await sent.edit_text("🛑 Stopped")
+                return
 
-                buffer += chunk
+            buffer += c
 
-                if time.time() - last_update > UPDATE_DELAY:
-                    try:
-                        await sent.edit_text(buffer + " ▌")
-                    except:
-                        pass
-                    last_update = time.time()
+            if time.time() - last > UPDATE_INTERVAL:
+                try:
+                    await sent.edit_text(buffer[-3500:])
+                except:
+                    pass
+                last = time.time()
 
-            await sent.edit_text(buffer)
+        await sent.edit_text(buffer[:4000])
 
-        finally:
-            active_chat = None
+        save(chat_id, text, buffer)
 
-# ---------------- WEB SERVER ---------------- #
+# ───────────────────────── WEB SERVER ───────────────────────── #
 
-class Handler(BaseHTTPRequestHandler):
+class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot running")
+        self.wfile.write(b"OK")
 
-def run_server():
+def run_web():
     port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
 
-# ---------------- RUN ---------------- #
+# ───────────────────────── BOT RUN ───────────────────────── #
 
-async def run_bot():
+async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("models", models))
-    app.add_handler(CommandHandler("setmodel", set_model))
-    app.add_handler(CommandHandler("current", current))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("persona", persona))
+    app.add_handler(CommandHandler("tone", tone))
+    app.add_handler(CommandHandler("setmodel", setmodel))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    await app.run_polling()
 
-    print("🤖 Stable Agent Bot Running...")
-
-    await asyncio.Event().wait()
-
-# ---------------- MAIN ---------------- #
+# ───────────────────────── ENTRY ───────────────────────── #
 
 if __name__ == "__main__":
-    threading.Thread(target=run_server).start()
-    asyncio.run(run_bot())
+    threading.Thread(target=run_web, daemon=True).start()
+    asyncio.run(main())
