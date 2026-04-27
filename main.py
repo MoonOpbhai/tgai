@@ -1,11 +1,18 @@
 import os
 import asyncio
 import threading
+import json
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
 # ---------------- CONFIG ---------------- #
 
@@ -17,40 +24,25 @@ MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 
 DEFAULT_MODEL = "stepfun-ai/step-3.5-flash"
 
-# ---------------- SAFETY ---------------- #
-
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     print("❌ Missing ENV variables")
     exit(1)
 
-# ---------------- MODEL HELPERS ---------------- #
+# ---------------- MODELS ---------------- #
 
 def get_models():
     headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}"}
-
     try:
         res = requests.get(MODELS_URL, headers=headers, timeout=20)
-
         if res.status_code != 200:
             return []
-
-        data = res.json().get("data", [])
-
-        models = []
-        for m in data:
-            mid = m.get("id", "")
-            if mid:
-                models.append(mid)
-
-        return models
-
-    except Exception as e:
-        print("Model error:", e)
+        return [m["id"] for m in res.json().get("data", []) if "id" in m]
+    except:
         return []
 
-# ---------------- NVIDIA CHAT ---------------- #
+# ---------------- STREAMING NVIDIA ---------------- #
 
-def ask_nvidia(user_text, model):
+def stream_nvidia(user_text, model):
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
@@ -59,92 +51,104 @@ def ask_nvidia(user_text, model):
     payload = {
         "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant. Be concise and intelligent."
-            },
+            {"role": "system", "content": "You are a helpful assistant. Be concise."},
             {"role": "user", "content": user_text}
         ],
         "temperature": 0.6,
         "max_tokens": 800,
-        "stream": False
+        "stream": True
     }
 
-    try:
-        res = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+    with requests.post(API_URL, headers=headers, json=payload, stream=True, timeout=60) as res:
+        if res.status_code != 200:
+            yield f"API Error {res.status_code}"
+            return
 
-        if res.status_code == 200:
-            return res.json()["choices"][0]["message"]["content"]
+        for line in res.iter_lines():
+            if not line:
+                continue
 
-        return f"API Error {res.status_code}: {res.text}"
+            line = line.decode("utf-8")
 
-    except Exception as e:
-        return f"Error: {str(e)}"
+            if line.startswith("data: "):
+                line = line[6:]
 
-# ---------------- TELEGRAM HANDLERS ---------------- #
+            if line == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(line)
+                delta = chunk["choices"][0]["delta"].get("content", "")
+                if delta:
+                    yield delta
+            except:
+                continue
+
+# ---------------- TELEGRAM COMMANDS ---------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = context.user_data.get("model", DEFAULT_MODEL)
-
     await update.message.reply_text(
-        f"🤖 Bot Ready!\n\n"
-        f"🧠 Default Model:\n{model}\n\n"
-        f"/models - list models\n"
-        f"/setmodel <name> - change model\n"
-        f"/current - current model\n"
+        f"🤖 AI Bot Ready\n\n🧠 Model:\n{model}\n\n"
+        "/models\n/setmodel <name>\n/current"
     )
 
-# -------- MODELS -------- #
-
 async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Fetching models...")
-
+    await update.message.reply_text("⏳ Loading models...")
     models_list = get_models()
 
     if not models_list:
         await update.message.reply_text("❌ No models found")
         return
 
-    text = "📦 Available NVIDIA Models:\n\n"
-
+    text = "📦 Models:\n\n"
     for i, m in enumerate(models_list[:50]):
         text += f"{i+1}. {m}\n"
 
     await update.message.reply_text(text)
-
-# -------- SET MODEL -------- #
 
 async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /setmodel <model_name>")
         return
 
-    model = " ".join(context.args).strip()
+    model = " ".join(context.args)
     context.user_data["model"] = model
 
-    await update.message.reply_text(f"✅ Model set:\n\n🧠 {model}")
-
-# -------- CURRENT MODEL -------- #
+    await update.message.reply_text(f"✅ Model set:\n{model}")
 
 async def current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = context.user_data.get("model", DEFAULT_MODEL)
     await update.message.reply_text(f"🧠 Current Model:\n{model}")
 
-# -------- CHAT -------- #
+# ---------------- LIVE CHAT (STREAMING) ---------------- #
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-
     model = context.user_data.get("model", DEFAULT_MODEL)
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
-    )
+    sent = await update.message.reply_text("⏳ thinking...")
 
-    reply = ask_nvidia(user_text, model)
+    full_text = ""
 
-    await update.message.reply_text(reply)
+    def run_stream():
+        return list(stream_nvidia(user_text, model))
+
+    loop = asyncio.get_event_loop()
+    chunks = await loop.run_in_executor(None, run_stream)
+
+    for chunk in chunks:
+        full_text += chunk
+
+        try:
+            await sent.edit_text(full_text + " ▌")
+        except:
+            pass
+
+    try:
+        await sent.edit_text(full_text)
+    except:
+        pass
 
 # ---------------- WEB SERVER (RENDER FIX) ---------------- #
 
@@ -152,14 +156,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running")
+        self.wfile.write(b"Bot running")
 
 def run_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-# ---------------- BOT RUN ---------------- #
+# ---------------- RUN BOT ---------------- #
 
 async def run_bot():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -174,7 +177,7 @@ async def run_bot():
     await app.start()
     await app.updater.start_polling()
 
-    print("🤖 StepFun Agent Bot Running...")
+    print("🤖 Bot Running with Streaming...")
 
     await asyncio.Event().wait()
 
