@@ -22,7 +22,7 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 
-DEFAULT_MODEL = "stepfun-ai/step-3.5-flash"
+DEFAULT_MODEL = "deepseek-ai/deepseek-v4-flash"
 
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     print("❌ Missing ENV variables")
