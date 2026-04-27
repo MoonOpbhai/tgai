@@ -8,7 +8,7 @@ import logging
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update, constants
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -48,7 +48,7 @@ user_stop = set()
 # ───────────────────────── SYSTEM PROMPT ───────────────────────── #
 
 SYSTEM_PROMPT = """
-You are a high-level autonomous assistant.
+You are a high-level autonomous AI assistant.
 Be accurate, concise, and human-like.
 """
 
@@ -113,13 +113,24 @@ def save(chat_id, user_text, bot_text):
 # ───────────────────────── COMMANDS ───────────────────────── #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot Online")
+    await update.message.reply_text("🤖 Pro Agent Bot Online")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_stop.add(update.effective_chat.id)
-    await update.message.reply_text("🛑 Stop signal sent")
+    await update.message.reply_text("🛑 Stopping response...")
 
-# ───────────────────────── MAIN HANDLER ───────────────────────── #
+# ⭐ MODEL CHANGE COMMAND (FIXED)
+async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /setmodel <model-name>")
+        return
+
+    model = " ".join(context.args).strip()
+    context.user_data["model"] = model
+
+    await update.message.reply_text(f"✅ Model changed:\n{model}")
+
+# ───────────────────────── MAIN CHAT ───────────────────────── #
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -127,9 +138,9 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     model = context.user_data.get("model", DEFAULT_MODEL)
 
-    # 🚫 BLOCK IF BUSY
+    # 🚫 block if busy
     if user_locks[chat_id].locked():
-        await update.message.reply_text("⏳ Wait, I am still replying...")
+        await update.message.reply_text("⏳ I am still replying to your previous message...")
         return
 
     async with user_locks[chat_id]:
@@ -149,6 +160,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         for chunk in chunks:
 
+            # 🛑 STOP SUPPORT
             if chat_id in user_stop:
                 user_stop.discard(chat_id)
                 await sent.edit_text("🛑 Stopped")
@@ -164,6 +176,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 last_update = time.time()
 
         await sent.edit_text(buffer[:4000])
+
         save(chat_id, text, buffer)
 
 # ───────────────────────── WEB SERVER (RENDER FIX) ───────────────────────── #
@@ -179,17 +192,16 @@ class Handler(BaseHTTPRequestHandler):
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    logger.info(f"Web server running on {port}")
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-# ───────────────────────── BOT START (FIXED) ───────────────────────── #
+# ───────────────────────── BOT START ───────────────────────── #
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("setmodel", setmodel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
     await app.initialize()
@@ -197,10 +209,9 @@ async def main():
     await app.updater.start_polling(drop_pending_updates=True)
 
     logger.info("Bot running...")
-
     await asyncio.Event().wait()
 
-# ───────────────────────── ENTRYPOINT (FIXED FOR RENDER) ───────────────────────── #
+# ───────────────────────── ENTRYPOINT ───────────────────────── #
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
