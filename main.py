@@ -21,7 +21,7 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
-DEFAULT_MODEL = "qwen/qwen2.5-72b-instruct"
+DEFAULT_MODEL = " abacusai/dracarys-llama-3.1-70b-instruct"
 
 # ---------------------------------------- #
 # 🧠 Agent
