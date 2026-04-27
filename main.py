@@ -1,22 +1,31 @@
 import os
+import asyncio
+import sys
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ---------------- CONFIG ---------------- #
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL = "abacusai/dracarys-llama-3.1-70b-instruct"
 
+# ---------------- SAFETY CHECK ---------------- #
+
+if not TELEGRAM_BOT_TOKEN:
+    print("❌ TELEGRAM_BOT_TOKEN missing")
+    sys.exit(1)
+
+if not NVIDIA_API_KEY:
+    print("❌ NVIDIA_API_KEY missing")
+    sys.exit(1)
+
 # ---------------- NVIDIA ---------------- #
 
 def ask_nvidia(user_text):
-    if not NVIDIA_API_KEY:
-        return "❌ NVIDIA_API_KEY missing"
-
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
@@ -44,17 +53,15 @@ def ask_nvidia(user_text):
     except Exception as e:
         return f"Error: {str(e)}"
 
-
 # ---------------- HANDLERS ---------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot ready! Just send message.")
+    await update.message.reply_text("🤖 Bot ready! Send message.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
-    # ✅ correct typing indicator
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action="typing"
@@ -64,18 +71,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply)
 
+# ---------------- BOT RUNNER (FIXED) ---------------- #
 
-# ---------------- MAIN ---------------- #
-
-def main():
+async def run_bot():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot running...")
-    app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
 
+    print("🤖 Bot running...")
+
+    await asyncio.Event().wait()  # keeps alive
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run_bot())
