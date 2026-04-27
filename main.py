@@ -1,6 +1,7 @@
 import os
 import asyncio
 import threading
+import time
 import json
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -22,16 +23,33 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 
-DEFAULT_MODEL = "deepseek-ai/deepseek-v4-flash"
+DEFAULT_MODEL = "stepfun-ai/step-3.5-flash"
 
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     print("❌ Missing ENV variables")
     exit(1)
 
+# ---------------- STOP CONTROL ---------------- #
+
+user_stop = set()
+
+# ---------------- SYSTEM PROMPT (AGENT MODE) ---------------- #
+
+SYSTEM_PROMPT = """
+You are an autonomous AI agent.
+
+Rules:
+- Think step by step internally
+- Break tasks into logic if needed
+- Be smart, concise, and helpful
+- Act like a reasoning assistant, not a dumb chatbot
+"""
+
 # ---------------- MODELS ---------------- #
 
 def get_models():
     headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}"}
+
     try:
         res = requests.get(MODELS_URL, headers=headers, timeout=20)
         if res.status_code != 200:
@@ -40,7 +58,7 @@ def get_models():
     except:
         return []
 
-# ---------------- STREAMING NVIDIA ---------------- #
+# ---------------- NVIDIA STREAM ---------------- #
 
 def stream_nvidia(user_text, model):
     headers = {
@@ -51,7 +69,7 @@ def stream_nvidia(user_text, model):
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant. Be concise."},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_text}
         ],
         "temperature": 0.6,
@@ -84,17 +102,27 @@ def stream_nvidia(user_text, model):
             except:
                 continue
 
-# ---------------- TELEGRAM COMMANDS ---------------- #
+# ---------------- COMMANDS ---------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = context.user_data.get("model", DEFAULT_MODEL)
+
     await update.message.reply_text(
-        f"🤖 AI Bot Ready\n\n🧠 Model:\n{model}\n\n"
-        "/models\n/setmodel <name>\n/current"
+        f"🤖 Agent Bot Ready\n\n"
+        f"🧠 Model:\n{model}\n\n"
+        "/models - list\n"
+        "/setmodel - change\n"
+        "/current - show\n"
+        "/stop - stop response"
     )
 
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_stop.add(update.effective_chat.id)
+    await update.message.reply_text("🛑 Stopped current response")
+
 async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Loading models...")
+    await update.message.reply_text("⏳ loading models...")
+
     models_list = get_models()
 
     if not models_list:
@@ -102,14 +130,14 @@ async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = "📦 Models:\n\n"
-    for i, m in enumerate(models_list[:50]):
+    for i, m in enumerate(models_list[:40]):
         text += f"{i+1}. {m}\n"
 
     await update.message.reply_text(text)
 
 async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /setmodel <model_name>")
+        await update.message.reply_text("Usage: /setmodel <name>")
         return
 
     model = " ".join(context.args)
@@ -121,15 +149,22 @@ async def current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = context.user_data.get("model", DEFAULT_MODEL)
     await update.message.reply_text(f"🧠 Current Model:\n{model}")
 
-# ---------------- LIVE CHAT (STREAMING) ---------------- #
+# ---------------- CHAT (FAST + STOP + STREAM) ---------------- #
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    # reset stop flag
+    user_stop.discard(chat_id)
+
     user_text = update.message.text
     model = context.user_data.get("model", DEFAULT_MODEL)
 
     sent = await update.message.reply_text("⏳ thinking...")
 
     full_text = ""
+    last_update = 0
+    UPDATE_DELAY = 0.7  # FAST + safe
 
     def run_stream():
         return list(stream_nvidia(user_text, model))
@@ -138,19 +173,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chunks = await loop.run_in_executor(None, run_stream)
 
     for chunk in chunks:
+
+        # STOP CHECK
+        if chat_id in user_stop:
+            await sent.edit_text("🛑 Stopped")
+            return
+
         full_text += chunk
 
-        try:
-            await sent.edit_text(full_text + " ▌")
-        except:
-            pass
+        # FAST UPDATE CONTROL
+        if time.time() - last_update > UPDATE_DELAY:
+            try:
+                await sent.edit_text(full_text + " ▌")
+            except:
+                pass
+            last_update = time.time()
 
     try:
         await sent.edit_text(full_text)
     except:
         pass
 
-# ---------------- WEB SERVER (RENDER FIX) ---------------- #
+# ---------------- WEB SERVER ---------------- #
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -168,6 +212,7 @@ async def run_bot():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("models", models))
     app.add_handler(CommandHandler("setmodel", set_model))
     app.add_handler(CommandHandler("current", current))
@@ -177,7 +222,7 @@ async def run_bot():
     await app.start()
     await app.updater.start_polling()
 
-    print("🤖 Bot Running with Streaming...")
+    print("🤖 Agent Bot Running...")
 
     await asyncio.Event().wait()
 
