@@ -9,12 +9,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-
 MODEL = "abacusai/dracarys-llama-3.1-70b-instruct"
 
 # ---------------- NVIDIA ---------------- #
 
 def ask_nvidia(user_text):
+    if not NVIDIA_API_KEY:
+        return "❌ NVIDIA_API_KEY missing"
+
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
@@ -33,9 +35,12 @@ def ask_nvidia(user_text):
 
     try:
         res = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
-        return f"API Error: {res.status_code} - {res.text}"
+
+        return f"API Error {res.status_code}: {res.text}"
+
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -49,8 +54,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
-    # typing feel
-    await update.message.chat.send_action(action="typing")
+    # ✅ correct typing indicator
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action="typing"
+    )
 
     reply = ask_nvidia(user_text)
 
