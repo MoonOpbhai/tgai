@@ -17,52 +17,37 @@ from telegram.ext import (
     filters,
 )
 
-# ───────────────── LOGGING ───────────────── #
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("AgentBot")
-
 # ───────────────── CONFIG ───────────────── #
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NVIDIA_API_KEY     = os.getenv("NVIDIA_API_KEY", "").strip()
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-
 MODEL = "openai/gpt-oss-120b"
 
-MAX_HISTORY = 20
+MAX_HISTORY = 0  # 🚀 RAW MODE → no memory
 STREAM_TIMEOUT = 90
 
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     raise SystemExit("Missing API keys")
 
-# ───────────────── MEMORY ───────────────── #
+# ───────────────── STATE ───────────────── #
 
-conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 user_locks = defaultdict(asyncio.Lock)
 user_stop = set()
 
-# ───────────────── SYSTEM PROMPT (PURE API MODE) ───────────────── #
+# ───────────────── SYSTEM PROMPT (MINIMAL RAW MODE) ───────────────── #
 
-SYSTEM_PROMPT = """
-You are a highly intelligent AI assistant.
+SYSTEM_PROMPT = "You are a helpful assistant."
 
-RULES:
-- Respond naturally based on user's input language
-- Do not force any language style
-- Do not over-explain unless asked
-- Be accurate, clear, and helpful
-"""
-
-# ───────────────── STREAM AI ───────────────── #
+# ───────────────── STREAM AI (RAW OUTPUT) ───────────────── #
 
 def stream_ai(messages):
     payload = {
         "model": MODEL,
         "messages": messages,
-        "temperature": 0.6,
-        "max_tokens": 900,
+        "temperature": 0.7,
+        "max_tokens": 1000,
         "stream": True,
     }
 
@@ -100,47 +85,40 @@ def stream_ai(messages):
     except Exception as e:
         yield f"Error: {e}"
 
-# ───────────────── MEMORY BUILD ───────────────── #
+# ───────────────── MESSAGE BUILDER (RAW ONLY USER INPUT) ───────────────── #
 
-def build_messages(chat_id, text):
-    history = list(conversation_history[chat_id])
+def build_messages(text):
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": text}
+    ]
 
-    return (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
-        + history
-        + [{"role": "user", "content": text}]
-    )
-
-# ───────────────── SAVE MEMORY ───────────────── #
-
-def save(chat_id, user_text, bot_text):
-    conversation_history[chat_id].append({"role": "user", "content": user_text})
-    conversation_history[chat_id].append({"role": "assistant", "content": bot_text})
-
-# ───────────────── COMMANDS ───────────────── #
+# ───────────────── START ───────────────── #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 AI Agent Bot Online")
+    await update.message.reply_text("🤖 RAW API Bot Online")
+
+# ───────────────── STOP ───────────────── #
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_stop.add(update.effective_chat.id)
-    await update.message.reply_text("🛑 Stopping response...")
+    await update.message.reply_text("🛑 Stopped")
 
-# ───────────────── MAIN CHAT ───────────────── #
+# ───────────────── MAIN HANDLER (RAW OUTPUT ONLY) ───────────────── #
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
     if user_locks[chat_id].locked():
-        await update.message.reply_text("⏳ Please wait, I am still replying...")
+        await update.message.reply_text("⏳ Busy...")
         return
 
     async with user_locks[chat_id]:
 
-        sent = await update.message.reply_text("⏳ thinking...")
+        sent = await update.message.reply_text("⏳ ...")
 
-        messages = build_messages(chat_id, text)
+        messages = build_messages(text)
 
         buffer = ""
         last_update = time.time()
@@ -160,27 +138,24 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             buffer += chunk
 
-            # stable update (no flicker / no half text issue)
-            if time.time() - last_update > 0.6:
+            # 🚀 only safe update (no cutting logic)
+            if time.time() - last_update > 0.5:
                 try:
                     await sent.edit_text(buffer[:4000])
                 except:
                     pass
                 last_update = time.time()
 
-        final_text = buffer.strip()
-
-        if final_text:
+        # FINAL RAW OUTPUT (NO MODIFICATION)
+        if buffer.strip():
             try:
-                await sent.edit_text(final_text[:4000])
+                await sent.edit_text(buffer[:4000])
             except:
-                await update.message.reply_text(final_text[:4000])
+                await update.message.reply_text(buffer[:4000])
         else:
             await sent.edit_text("⚠️ Empty response")
 
-        save(chat_id, text, final_text)
-
-# ───────────────── WEB SERVER (RENDER SAFE) ───────────────── #
+# ───────────────── WEB SERVER ───────────────── #
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -208,10 +183,9 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    logger.info("Bot running (stable production mode)")
     await asyncio.Event().wait()
 
-# ───────────────── ENTRYPOINT ───────────────── #
+# ───────────────── ENTRY ───────────────── #
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
