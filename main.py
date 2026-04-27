@@ -1,7 +1,9 @@
 import os
 import asyncio
-import sys
+import threading
 import requests
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -13,15 +15,15 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODEL = "abacusai/dracarys-llama-3.1-70b-instruct"
 
-# ---------------- SAFETY CHECK ---------------- #
+# ---------------- SAFETY ---------------- #
 
 if not TELEGRAM_BOT_TOKEN:
     print("❌ TELEGRAM_BOT_TOKEN missing")
-    sys.exit(1)
+    exit(1)
 
 if not NVIDIA_API_KEY:
     print("❌ NVIDIA_API_KEY missing")
-    sys.exit(1)
+    exit(1)
 
 # ---------------- NVIDIA ---------------- #
 
@@ -48,30 +50,27 @@ def ask_nvidia(user_text):
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
 
-        return f"API Error {res.status_code}: {res.text}"
+        return f"API Error {res.status_code}"
 
     except Exception as e:
         return f"Error: {str(e)}"
 
-# ---------------- HANDLERS ---------------- #
+# ---------------- TELEGRAM BOT ---------------- #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot ready! Send message.")
+    await update.message.reply_text("🤖 Bot ready!")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action="typing"
     )
 
-    reply = ask_nvidia(user_text)
-
+    reply = ask_nvidia(update.message.text)
     await update.message.reply_text(reply)
 
-# ---------------- BOT RUNNER (FIXED) ---------------- #
+# ---------------- TELEGRAM RUN ---------------- #
 
 async def run_bot():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -85,7 +84,26 @@ async def run_bot():
 
     print("🤖 Bot running...")
 
-    await asyncio.Event().wait()  # keeps alive
+    await asyncio.Event().wait()
+
+# ---------------- WEB SERVER (FOR RENDER) ---------------- #
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+# ---------------- MAIN ---------------- #
 
 if __name__ == "__main__":
+    # start web server (Render requirement)
+    threading.Thread(target=run_server).start()
+
+    # start telegram bot
     asyncio.run(run_bot())
