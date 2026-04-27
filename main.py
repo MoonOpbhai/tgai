@@ -29,6 +29,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NVIDIA_API_KEY     = os.getenv("NVIDIA_API_KEY", "").strip()
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
 DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 DB_FILE = "memory.db"
@@ -36,7 +37,7 @@ DB_FILE = "memory.db"
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     raise SystemExit("Missing API keys")
 
-# ───────────────── SQLITE MEMORY ───────────────── #
+# ───────────────── DATABASE MEMORY ───────────────── #
 
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
@@ -58,7 +59,7 @@ def save_msg(chat_id, role, content):
     )
     conn.commit()
 
-def get_history(chat_id, limit=10):
+def get_history(chat_id, limit=8):
     cursor.execute(
         "SELECT role, content FROM messages WHERE chat_id=? ORDER BY timestamp DESC LIMIT ?",
         (str(chat_id), limit * 2)
@@ -67,7 +68,7 @@ def get_history(chat_id, limit=10):
     rows.reverse()
     return [{"role": r[0], "content": r[1]} for r in rows]
 
-def clear_history(chat_id):
+def clear_memory(chat_id):
     cursor.execute("DELETE FROM messages WHERE chat_id=?", (str(chat_id),))
     conn.commit()
 
@@ -95,80 +96,90 @@ def stream_ai(messages, model):
         "Content-Type": "application/json",
     }
 
-    with requests.post(API_URL, json=payload, headers=headers,
-                       stream=True, timeout=90) as r:
+    try:
+        with requests.post(API_URL, json=payload, headers=headers,
+                           stream=True, timeout=90) as r:
 
-        if r.status_code != 200:
-            yield f"API Error {r.status_code}"
-            return
+            if r.status_code != 200:
+                yield f"API Error {r.status_code}"
+                return
 
-        for line in r.iter_lines():
-            if not line:
-                continue
+            for line in r.iter_lines():
+                if not line:
+                    continue
 
-            try:
-                line = line.decode().replace("data: ", "")
-                if line == "[DONE]":
-                    return
+                try:
+                    line = line.decode().replace("data: ", "")
+                    if line == "[DONE]":
+                        return
 
-                data = json.loads(line)
-                delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                    data = json.loads(line)
+                    delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
 
-                if delta:
-                    yield delta
+                    if delta:
+                        yield delta
 
-            except:
-                continue
+                except:
+                    continue
 
-# ───────────────── BUILD MESSAGES (WITH MEMORY) ───────────────── #
+    except Exception as e:
+        yield f"Error: {e}"
 
-def build_messages(chat_id, text):
+# ───────────────── BUILD MESSAGES ───────────────── #
+
+def build_messages(chat_id):
     history = get_history(chat_id)
 
-    return (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
-        + history
-        + [{"role": "user", "content": text}]
-    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *history
+    ]
 
 # ───────────────── START ───────────────── #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Bot Online\n\n"
-        "/setmodel\n"
-        "/clear"
+        "/setmodel <model>\n"
+        "/clearmem\n"
+        "/stop"
     )
+
+# ───────────────── STOP ───────────────── #
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_stop.add(update.effective_chat.id)
+    await update.message.reply_text("🛑 Stopped")
 
 # ───────────────── CLEAR MEMORY ───────────────── #
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clearmem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    clear_history(chat_id)
+    clear_memory(chat_id)
     await update.message.reply_text("🗑️ Memory cleared")
 
-# ───────────────── SET MODEL ───────────────── #
+# ───────────────── SET MODEL (FIXED) ───────────────── #
 
 async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if not context.args:
-        await update.message.reply_text("Usage: /setmodel <name>")
+        await update.message.reply_text("Usage: /setmodel <model_name>")
         return
 
-    model = " ".join(context.args)
+    model = " ".join(context.args).strip()
     user_model[chat_id] = model
 
     await update.message.reply_text(f"✅ Model set:\n{model}")
 
-# ───────────────── MAIN HANDLER ───────────────── #
+# ───────────────── MAIN CHAT ───────────────── #
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
     if user_locks[chat_id].locked():
-        await update.message.reply_text("⏳ Busy...")
+        await update.message.reply_text("⏳ Wait...")
         return
 
     async with user_locks[chat_id]:
@@ -177,7 +188,10 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         model = user_model[chat_id]
 
-        messages = build_messages(chat_id, text)
+        messages = build_messages(chat_id)
+
+        # add current user message only for API
+        messages.append({"role": "user", "content": text})
 
         buffer = ""
         last_update = time.time()
@@ -215,7 +229,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await sent.edit_text("⚠️ Empty response")
 
-        # 💾 SAVE MEMORY
+        # save memory
         save_msg(chat_id, "user", text)
         save_msg(chat_id, "assistant", final)
 
@@ -240,7 +254,8 @@ async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("clearmem", clearmem))
     app.add_handler(CommandHandler("setmodel", setmodel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
@@ -248,7 +263,7 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    logger.info("Bot running with DB memory...")
+    logger.info("Bot running...")
     await asyncio.Event().wait()
 
 # ───────────────── ENTRY ───────────────── #
