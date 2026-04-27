@@ -26,14 +26,16 @@ logger = logging.getLogger("Bot")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or "0")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
 DB_FILE = "memory.db"
+MAX_CONTEXT_MESSAGES = 100
 
-if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
-    raise SystemExit("Missing API keys")
+if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY or not OWNER_ID:
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN, NVIDIA_API_KEY or OWNER_ID")
 
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
@@ -54,6 +56,14 @@ CREATE TABLE IF NOT EXISTS settings (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS approved_users (
+    user_id TEXT PRIMARY KEY,
+    approved_by TEXT,
+    timestamp INTEGER
+)
+""")
+
 conn.commit()
 
 def save_msg(chat_id, role, content):
@@ -62,17 +72,39 @@ def save_msg(chat_id, role, content):
         (str(chat_id), role, content, int(time.time()))
     )
     conn.commit()
+    prune_messages(chat_id)
 
-def get_history(chat_id, limit=6):
+def prune_messages(chat_id):
     cursor.execute(
-        "SELECT role, content FROM messages WHERE chat_id=? ORDER BY timestamp DESC LIMIT ?",
-        (str(chat_id), limit * 2)
+        """
+        DELETE FROM messages
+        WHERE chat_id = ?
+        AND rowid NOT IN (
+            SELECT rowid FROM messages
+            WHERE chat_id = ?
+            ORDER BY timestamp DESC, rowid DESC
+            LIMIT ?
+        )
+        """,
+        (str(chat_id), str(chat_id), MAX_CONTEXT_MESSAGES)
+    )
+    conn.commit()
+
+def get_history(chat_id, limit=MAX_CONTEXT_MESSAGES):
+    cursor.execute(
+        """
+        SELECT role, content FROM messages
+        WHERE chat_id=?
+        ORDER BY timestamp DESC, rowid DESC
+        LIMIT ?
+        """,
+        (str(chat_id), limit)
     )
     rows = cursor.fetchall()
     rows.reverse()
     return [{"role": r[0], "content": r[1]} for r in rows]
 
-def clear_memory(chat_id):
+def reset_session(chat_id):
     cursor.execute("DELETE FROM messages WHERE chat_id=?", (str(chat_id),))
     conn.commit()
 
@@ -90,6 +122,26 @@ def get_saved_model(chat_id):
     )
     row = cursor.fetchone()
     return row[0] if row and row[0] else DEFAULT_MODEL
+
+def approve_user(user_id, approved_by):
+    cursor.execute(
+        "INSERT OR REPLACE INTO approved_users (user_id, approved_by, timestamp) VALUES (?, ?, ?)",
+        (str(user_id), str(approved_by), int(time.time()))
+    )
+    conn.commit()
+
+def is_owner(user_id):
+    return int(user_id) == OWNER_ID
+
+def is_approved(user_id):
+    if is_owner(user_id):
+        return True
+
+    cursor.execute(
+        "SELECT user_id FROM approved_users WHERE user_id=?",
+        (str(user_id),)
+    )
+    return cursor.fetchone() is not None
 
 user_model = defaultdict(lambda: DEFAULT_MODEL)
 user_lock = defaultdict(asyncio.Lock)
@@ -134,6 +186,7 @@ Use `inline code` for short commands, filenames, variables, model names, errors,
 Use fenced code blocks for full code, terminal commands, JSON, Python, Bash, JavaScript, HTML, CSS, etc.
 Correct code block means three backticks, language name, code, then three backticks.
 Never write only the language name before code.
+Do not use HTML tags in your response.
 Do not use ### headings unless the user asks for documentation.
 
 Coding:
@@ -221,16 +274,15 @@ def apply_inline_markdown(segment):
     segment = html.escape(segment)
 
     segment = re.sub(
-        r"`([^`\n]+)`",
-        lambda m: f"<code>{m.group(1)}</code>",
+        r"\*\*([^\n*][\s\S]*?[^\n*])\*\*",
+        lambda m: f"<b>{m.group(1)}</b>",
         segment
     )
 
     segment = re.sub(
-        r"\*\*(.+?)\*\*",
-        lambda m: f"<b>{m.group(1)}</b>",
-        segment,
-        flags=re.DOTALL
+        r"`([^`\n]+)`",
+        lambda m: f"<code>{m.group(1)}</code>",
+        segment
     )
 
     return segment
@@ -244,24 +296,28 @@ def markdown_to_telegram_html(text):
     parts = []
     pos = 0
 
-    pattern = re.compile(r"```([a-zA-Z0-9_+\-.]*)?\n?(.*?)```", re.DOTALL)
+    pattern = re.compile(r"```(?:[a-zA-Z0-9_+\-.]*)?\n?([\s\S]*?)```")
 
     for match in pattern.finditer(text):
         before = text[pos:match.start()]
+
         if before:
             parts.append(apply_inline_markdown(before))
 
-        code = match.group(2).strip("\n")
+        code = match.group(1).strip("\n")
         code = html.escape(code)
-        parts.append(f"<pre><code>{code}</code></pre>")
+        parts.append(f"<pre>{code}</pre>")
+
         pos = match.end()
 
     rest = text[pos:]
+
     if rest:
         parts.append(apply_inline_markdown(rest))
 
     out = "".join(parts)
     out = re.sub(r"\n{5,}", "\n\n\n", out)
+
     return out.strip()
 
 def split_text(text, limit=3900):
@@ -405,7 +461,6 @@ async def send_final_response(sent, update, final):
         final = "Empty response mila."
 
     chunks = split_text(final, 3900)
-
     first = True
 
     for chunk in chunks:
@@ -440,17 +495,63 @@ async def send_final_response(sent, update, final):
                 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_approved(user_id):
+        await update.message.reply_text(
+            f"Access denied.\nYour user id: {user_id}\nAsk owner to approve you."
+        )
+        return
+
     await send_telegram_text(update, "**Bot online.** Message bhejo.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_approved(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
     user_stop.add(update.effective_chat.id)
     await send_telegram_text(update, "Stopping...")
 
-async def clearmem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    clear_memory(update.effective_chat.id)
-    await send_telegram_text(update, "**Memory cleared.**")
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_approved(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
+    reset_session(update.effective_chat.id)
+    await send_telegram_text(update, "**Session reset.** Memory cleared for this chat.")
+
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+        await update.message.reply_text("Owner only.")
+        return
+
+    if not context.args:
+        await send_telegram_text(update, "Usage: `/approve user_id`")
+        return
+
+    target_id = context.args[0].strip()
+
+    if not target_id.isdigit():
+        await update.message.reply_text("Invalid user id.")
+        return
+
+    approve_user(target_id, user_id)
+    await send_telegram_text(update, f"Approved:\n`{target_id}`")
 
 async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_approved(user_id):
+        await update.message.reply_text("Access denied.")
+        return
+
     if not context.args:
         await send_telegram_text(update, "Usage: `/setmodel model_name`")
         return
@@ -463,30 +564,16 @@ async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_telegram_text(update, f"Model set:\n`{model}`")
 
-async def modelcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    model = user_model.get(chat_id) or get_saved_model(chat_id)
-    user_model[chat_id] = model
-    await send_telegram_text(update, f"Current model:\n`{model}`")
-
-async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """
-**Good models:**
-
-`meta/llama-3.3-70b-instruct`
-`mistralai/mistral-small-4-119b-2603`
-`nvidia/llama-3.3-nemotron-super-49b-v1`
-`qwen/qwen3-next-80b-a3b-instruct`
-`openai/gpt-oss-120b`
-
-Use:
-`/setmodel meta/llama-3.3-70b-instruct`
-"""
-    await send_telegram_text(update, text)
-
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
+
+    if not is_approved(user_id):
+        await update.message.reply_text(
+            f"Access denied.\nYour user id: {user_id}\nAsk owner to approve you."
+        )
+        return
 
     if not text:
         return
@@ -545,10 +632,9 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("clearmem", clearmem))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("approve", approve))
     app.add_handler(CommandHandler("setmodel", setmodel))
-    app.add_handler(CommandHandler("model", modelcmd))
-    app.add_handler(CommandHandler("models", models))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
     await app.initialize()
