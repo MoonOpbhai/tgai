@@ -96,7 +96,7 @@ user_model = defaultdict(lambda: DEFAULT_MODEL)
 user_lock = defaultdict(asyncio.Lock)
 user_stop = set()
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = r'''
 You are a smart, calm, agentic AI assistant.
 
 Core behavior:
@@ -132,36 +132,412 @@ Avoid excessive emojis.
 Formatting:
 Use **bold** for important words when useful.
 Use `inline code` for short commands, filenames, variables, model names, errors, and APIs.
-Use triple backtick fenced code blocks for full code, terminal commands, JSON, Python, Bash, JavaScript, HTML, CSS, etc.
+Use fenced code blocks for full code, terminal commands, JSON, Python, Bash, JavaScript, HTML, CSS, etc.
+Correct code block means: three backticks, language name, code, then three backticks.
+Never write only the language name before code.
+Do not use ### headings unless the user asks for documentation.
 
-Correct:
-```python
-print("hello")
-Language behavior:
-Always reply in the same language and typing style as the user's latest message.
-If the user writes English, reply in English.
-If the user writes Hindi, reply in Hindi.
-If the user writes Hinglish, reply in Hinglish.
-If the user mixes Hindi and English, reply in natural Hinglish.
-Do not force Hindi.
-Do not force English.
-Match the user's tone naturally.
+Coding:
+For bug fixes, give fixed code first.
+Then explain the bug shortly if explanation is needed.
+For VPS commands, give direct commands.
+For Telegram bot code, keep parse_mode and formatting safe.
+'''
 
-Tone:
-Be practical, direct, and human-like.
-Do not sound robotic.
-Do not over-explain unless needed.
-Do not lecture the user for casual slang, anger, or frustration.
-Stay calm and keep helping.
-Set a short boundary only for serious threats, hate, or harmful requests.
-Avoid fake assistant lines.
-Avoid excessive emojis.
+def detect_language_instruction(text):
+    text_l = text.lower()
 
-Formatting:
-Use **bold** for important words when useful.
-Use `inline code` for short commands, filenames, variables, model names, errors, and APIs.
-Use triple backtick fenced code blocks for full code, terminal commands, JSON, Python, Bash, JavaScript, HTML, CSS, etc.
+    has_devanagari = bool(re.search(r"[\u0900-\u097F]", text))
+    english_letters = len(re.findall(r"[A-Za-z]", text))
 
-Correct:
-```python
-print("hello")
+    hinglish_words = len(re.findall(
+        r"\b(kya|hai|hain|nhi|nahin|kaise|kese|kar|karo|kr|mujhe|tum|aap|bhai|bata|bolo|hona|chahiye|thek|sahi|galat|code|vps|wala|wasa|aisa|kaam|fix|de|do|mat|kyu|kyun|abhi|isme|usme|ye|wo|jo|jaisa|waisa|bana|banake|denge|chala|chalana|normal|bar|baar)\b",
+        text_l
+    ))
+
+    if has_devanagari and english_letters > 5:
+        return "The user's latest message is mixed Hindi and English. Reply in natural Hinglish matching their typing style."
+
+    if has_devanagari:
+        return "The user's latest message is Hindi. Reply in Hindi or natural Hinglish matching their style."
+
+    if hinglish_words >= 2:
+        return "The user's latest message is Hinglish. Reply in natural Hinglish matching their typing style."
+
+    if english_letters > 0:
+        return "The user's latest message is English or mostly English. Reply in English."
+
+    return "Reply in the same language and style as the user's latest message."
+
+def plain_cleanup(text):
+    if not text:
+        return ""
+
+    text = text.replace("\r\n", "\n")
+    text = text.replace("###", "")
+    text = re.sub(r"\n{5,}", "\n\n\n", text)
+
+    text = re.sub(
+        r"(?m)^python\s*\n(?=def |class |import |from |print\(|async |await |[a-zA-Z_][a-zA-Z0-9_]*\s*=)",
+        "```python\n",
+        text
+    )
+
+    text = re.sub(
+        r"(?m)^bash\s*\n(?=[a-zA-Z0-9_./~$-])",
+        "```bash\n",
+        text
+    )
+
+    text = re.sub(
+        r"(?m)^sh\s*\n(?=[a-zA-Z0-9_./~$-])",
+        "```bash\n",
+        text
+    )
+
+    text = re.sub(
+        r"(?m)^javascript\s*\n(?=const |let |var |function |import |export |async )",
+        "```javascript\n",
+        text
+    )
+
+    text = re.sub(
+        r"(?m)^js\s*\n(?=const |let |var |function |import |export |async )",
+        "```javascript\n",
+        text
+    )
+
+    text = re.sub(
+        r"(?m)^json\s*\n(?=[\[{])",
+        "```json\n",
+        text
+    )
+
+    if text.count("```") % 2 != 0:
+        text += "\n```"
+
+    return text.strip()
+
+def safe_raw_tail(text, limit=3800):
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+def apply_inline_markdown(segment):
+    segment = html.escape(segment)
+
+    segment = re.sub(
+        r"`([^`\n]+)`",
+        lambda m: f"<code>{m.group(1)}</code>",
+        segment
+    )
+
+    segment = re.sub(
+        r"\*\*(.+?)\*\*",
+        lambda m: f"<b>{m.group(1)}</b>",
+        segment,
+        flags=re.DOTALL
+    )
+
+    return segment
+
+def markdown_to_telegram_html(text):
+    if not text:
+        return ""
+
+    text = plain_cleanup(text)
+
+    parts = []
+    pos = 0
+
+    pattern = re.compile(r"```([a-zA-Z0-9_+\-.]*)?\n?(.*?)```", re.DOTALL)
+
+    for match in pattern.finditer(text):
+        before = text[pos:match.start()]
+        if before:
+            parts.append(apply_inline_markdown(before))
+
+        code = match.group(2).strip("\n")
+        code = html.escape(code)
+        parts.append(f"<pre><code>{code}</code></pre>")
+        pos = match.end()
+
+    rest = text[pos:]
+    if rest:
+        parts.append(apply_inline_markdown(rest))
+
+    out = "".join(parts)
+    out = re.sub(r"\n{5,}", "\n\n\n", out)
+    return out.strip()
+
+def stream_ai(messages, model):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.35,
+        "top_p": 0.85,
+        "max_tokens": 1400,
+        "stream": True,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with requests.post(
+            API_URL,
+            json=payload,
+            headers=headers,
+            stream=True,
+            timeout=120
+        ) as r:
+
+            if r.status_code != 200:
+                yield f"API Error {r.status_code}: {r.text[:700]}"
+                return
+
+            for line in r.iter_lines():
+                if not line:
+                    continue
+
+                line = line.decode("utf-8", errors="ignore").strip()
+
+                if not line.startswith("data:"):
+                    continue
+
+                line = line[5:].strip()
+
+                if line == "[DONE]":
+                    break
+
+                try:
+                    data = json.loads(line)
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+                except Exception:
+                    continue
+
+    except Exception as e:
+        yield f"Stream Error: {e}"
+
+def build_messages(chat_id, text):
+    history = get_history(chat_id)
+
+    current_rule = {
+        "role": "system",
+        "content": detect_language_instruction(text)
+    }
+
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        current_rule,
+    ] + history + [
+        {"role": "user", "content": text}
+    ]
+
+async def edit_telegram_text(message_obj, raw_text, formatted=True):
+    raw_text = plain_cleanup(raw_text)
+
+    if not raw_text:
+        raw_text = "Empty response."
+
+    raw_text = raw_text[:3900]
+
+    if formatted:
+        html_text = markdown_to_telegram_html(raw_text)
+
+        try:
+            await message_obj.edit_text(
+                html_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Formatted edit failed: {e}")
+
+    try:
+        await message_obj.edit_text(
+            raw_text,
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.warning(f"Plain edit failed: {e}")
+
+async def send_telegram_text(update, text, formatted=True):
+    raw = plain_cleanup(text)
+
+    if not raw:
+        raw = "Empty response."
+
+    raw = raw[:3900]
+
+    if formatted:
+        html_text = markdown_to_telegram_html(raw)
+
+        try:
+            return await update.message.reply_text(
+                html_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.warning(f"Formatted send failed: {e}")
+
+    return await update.message.reply_text(
+        raw,
+        disable_web_page_preview=True
+    )
+
+async def smooth_stream(message_obj, generator, chat_id):
+    buffer = ""
+    last_update = 0
+    update_delay = 1.2
+
+    for chunk in generator:
+        if chat_id in user_stop:
+            user_stop.discard(chat_id)
+            await edit_telegram_text(message_obj, "Stopped.", formatted=False)
+            return None
+
+        buffer += chunk
+
+        if time.time() - last_update > update_delay:
+            preview = plain_cleanup(safe_raw_tail(buffer, limit=3600))
+
+            try:
+                await message_obj.edit_text(
+                    preview[:3900],
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.warning(f"Streaming preview failed: {e}")
+
+            last_update = time.time()
+
+    final = plain_cleanup(buffer)
+
+    if not final:
+        final = "Empty response mila."
+
+    await asyncio.sleep(0.4)
+
+    await edit_telegram_text(message_obj, final, formatted=True)
+    return final
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_telegram_text(update, "**Bot online.** Message bhejo.")
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_stop.add(update.effective_chat.id)
+    await send_telegram_text(update, "Stopping...")
+
+async def clearmem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_memory(update.effective_chat.id)
+    await send_telegram_text(update, "**Memory cleared.**")
+
+async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await send_telegram_text(update, "Usage: `/setmodel model_name`")
+        return
+
+    model = " ".join(context.args).strip()
+    chat_id = update.effective_chat.id
+
+    user_model[chat_id] = model
+    save_model(chat_id, model)
+
+    await send_telegram_text(update, f"Model set:\n`{model}`")
+
+async def modelcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    model = user_model.get(chat_id) or get_saved_model(chat_id)
+    user_model[chat_id] = model
+    await send_telegram_text(update, f"Current model:\n`{model}`")
+
+async def models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """
+**Good models:**
+
+`meta/llama-3.3-70b-instruct`
+`mistralai/mistral-small-4-119b-2603`
+`nvidia/llama-3.3-nemotron-super-49b-v1`
+`qwen/qwen3-next-80b-a3b-instruct`
+`openai/gpt-oss-120b`
+
+Use:
+`/setmodel meta/llama-3.3-70b-instruct`
+"""
+    await send_telegram_text(update, text)
+
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+
+    if not text:
+        return
+
+    if user_lock[chat_id].locked():
+        await send_telegram_text(update, "Wait, pehle wala response complete hone do.")
+        return
+
+    async with user_lock[chat_id]:
+        sent = await update.message.reply_text("Thinking...")
+
+        model = user_model.get(chat_id) or get_saved_model(chat_id)
+        user_model[chat_id] = model
+
+        messages = build_messages(chat_id, text)
+
+        gen = stream_ai(messages, model)
+        final = await smooth_stream(sent, gen, chat_id)
+
+        if not final:
+            final = "Empty response mila."
+
+        final = plain_cleanup(final)
+
+        await edit_telegram_text(sent, final, formatted=True)
+
+        save_msg(chat_id, "user", text)
+        save_msg(chat_id, "assistant", final)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+async def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("clearmem", clearmem))
+    app.add_handler(CommandHandler("setmodel", setmodel))
+    app.add_handler(CommandHandler("model", modelcmd))
+    app.add_handler(CommandHandler("models", models))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    logger.info("Bot running...")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
+    asyncio.run(main())
