@@ -29,7 +29,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NVIDIA_API_KEY     = os.getenv("NVIDIA_API_KEY", "").strip()
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-
 DEFAULT_MODEL = "moonshotai/kimi-k2-thinking"
 
 DB_FILE = "memory.db"
@@ -75,13 +74,12 @@ def clear_memory(chat_id):
 # ───────────────── STATE ───────────────── #
 
 user_model = defaultdict(lambda: DEFAULT_MODEL)
-user_mode  = defaultdict(lambda: "clean")  # clean / raw
 user_lock  = defaultdict(asyncio.Lock)
 user_stop  = set()
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 
-# ───────────────── STREAM AI ───────────────── #
+# ───────────────── 🔥 FIXED SSE STREAM ───────────────── #
 
 def stream_ai(messages, model):
     payload = {
@@ -98,16 +96,47 @@ def stream_ai(messages, model):
     }
 
     try:
-        with requests.post(API_URL, json=payload, headers=headers,
-                           stream=True, timeout=120) as r:
+        with requests.post(
+            API_URL,
+            json=payload,
+            headers=headers,
+            stream=True,
+            timeout=120
+        ) as r:
 
             if r.status_code != 200:
                 yield f"API Error: {r.text}"
                 return
 
-            for chunk in r.iter_content(chunk_size=1024):
-                if chunk:
-                    yield chunk.decode("utf-8", errors="ignore")
+            for line in r.iter_lines(decode_unicode=True):
+
+                if not line:
+                    continue
+
+                line = line.strip()
+
+                # remove SSE prefix
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+
+                if line == "[DONE]":
+                    return
+
+                try:
+                    data = json.loads(line)
+
+                    choices = data.get("choices", [])
+                    if not choices:
+                        continue
+
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+
+                    if content:
+                        yield content
+
+                except json.JSONDecodeError:
+                    continue
 
     except Exception as e:
         yield f"Stream Error: {e}"
@@ -129,7 +158,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Bot Online\n\n"
         "/setmodel <model>\n"
-        "/mode clean | raw\n"
         "/clearmem\n"
         "/stop"
     )
@@ -155,21 +183,6 @@ async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Model set:\n{model}")
 
-async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    if not context.args:
-        await update.message.reply_text("Usage: /mode clean or raw")
-        return
-
-    m = context.args[0].lower()
-    if m not in ["clean", "raw"]:
-        await update.message.reply_text("Use: clean or raw")
-        return
-
-    user_mode[chat_id] = m
-    await update.message.reply_text(f"✅ Mode set: {m}")
-
 # ───────────────── MAIN CHAT ───────────────── #
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,7 +198,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent = await update.message.reply_text("⏳ thinking...")
 
         model = user_model[chat_id]
-        mode  = user_mode[chat_id]
 
         messages = build_messages(chat_id, text)
 
@@ -208,7 +220,7 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             buffer += chunk
 
-            if time.time() - last_update > 0.6:
+            if time.time() - last_update > 0.5:
                 try:
                     await sent.edit_text(buffer[-4000:])
                 except:
@@ -217,33 +229,18 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         final = buffer.strip()
 
-        # ───────── MODE HANDLING ───────── #
-
-        if mode == "clean":
-            # try to extract only assistant content
+        if final:
             try:
-                data_lines = []
-                for line in final.split("\n"):
-                    if "content" in line:
-                        data_lines.append(line)
-                final_output = "\n".join(data_lines) if data_lines else final
+                await sent.edit_text(final[:4000])
             except:
-                final_output = final
+                await update.message.reply_text(final[:4000])
         else:
-            # RAW MODE
-            final_output = final
+            await sent.edit_text("⚠️ Empty response")
 
-        # send result
-        try:
-            await sent.edit_text(final_output[:4000])
-        except:
-            await update.message.reply_text(final_output[:4000])
-
-        # save memory
         save_msg(chat_id, "user", text)
-        save_msg(chat_id, "assistant", final_output)
+        save_msg(chat_id, "assistant", final)
 
-# ───────────────── WEB SERVER ───────────────── #
+# ───────────────── WEB SERVER (RENDER FIX) ───────────────── #
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -267,14 +264,13 @@ async def main():
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("clearmem", clearmem))
     app.add_handler(CommandHandler("setmodel", setmodel))
-    app.add_handler(CommandHandler("mode", mode))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    logger.info("Bot running (clean + raw mode)...")
+    logger.info("Bot running (FIXED SSE STREAM)...")
     await asyncio.Event().wait()
 
 # ───────────────── ENTRY ───────────────── #
