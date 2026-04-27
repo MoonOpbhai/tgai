@@ -35,8 +35,6 @@ DEFAULT_MODEL = "stepfun-ai/step-3.5-flash"
 MAX_HISTORY = 15
 STREAM_TIMEOUT = 90
 UPDATE_INTERVAL = 0.35
-RATE_LIMIT = 10
-RATE_WINDOW = 60
 
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     raise SystemExit("Missing API keys")
@@ -46,55 +44,12 @@ if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
 conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 user_locks = defaultdict(asyncio.Lock)
 user_stop = set()
-rate_tracker = defaultdict(lambda: deque(maxlen=RATE_LIMIT))
 
-user_profile = defaultdict(dict)
-user_tone = defaultdict(lambda: "friendly")
-user_persona = defaultdict(lambda: "default")
+# ───────────────────────── SYSTEM PROMPT ───────────────────────── #
 
-PERSONAS = {
-    "default": "You are a helpful intelligent AI assistant.",
-    "jarvis": "You are JARVIS from Iron Man: calm, precise, genius-level assistant.",
-    "teacher": "You explain everything like a great teacher.",
-    "coder": "You are a senior software engineer writing production code."
-}
-
-# ───────────────────────── RATE LIMIT ───────────────────────── #
-
-def is_rate_limited(chat_id):
-    now = time.time()
-    dq = rate_tracker[chat_id]
-
-    while dq and now - dq[0] > RATE_WINDOW:
-        dq.popleft()
-
-    if len(dq) >= RATE_LIMIT:
-        return True
-
-    dq.append(now)
-    return False
-
-# ───────────────────────── PROMPT ───────────────────────── #
-
-def build_prompt(chat_id):
-    name = user_profile[chat_id].get("name", "")
-    tone = user_tone[chat_id]
-    persona = PERSONAS.get(user_persona[chat_id], PERSONAS["default"])
-
-    return f"""
-{persona}
-
-STYLE:
-- Tone: {tone}
-- Natural human-like responses
-
-RULES:
-- Be accurate
-- No hallucination
-- Be structured and clear
-
-MEMORY:
-User name: {name if name else "unknown"}
+SYSTEM_PROMPT = """
+You are a high-level autonomous assistant.
+Be accurate, concise, and human-like.
 """
 
 # ───────────────────────── STREAM AI ───────────────────────── #
@@ -104,7 +59,7 @@ def stream_ai(messages, model):
         "model": model,
         "messages": messages,
         "temperature": 0.6,
-        "max_tokens": 1000,
+        "max_tokens": 900,
         "stream": True,
     }
 
@@ -146,7 +101,7 @@ def build_messages(chat_id, text, model):
     history = list(conversation_history[chat_id])
 
     return (
-        [{"role": "system", "content": build_prompt(chat_id)}]
+        [{"role": "system", "content": SYSTEM_PROMPT}]
         + history
         + [{"role": "user", "content": text}]
     )
@@ -158,50 +113,21 @@ def save(chat_id, user_text, bot_text):
 # ───────────────────────── COMMANDS ───────────────────────── #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Full Agent Bot Online")
+    await update.message.reply_text("🤖 Bot Online")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_stop.add(update.effective_chat.id)
-    await update.message.reply_text("🛑 Stopping response...")
+    await update.message.reply_text("🛑 Stop signal sent")
 
-async def persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("jarvis / teacher / coder / default")
-        return
-    user_persona[update.effective_chat.id] = context.args[0]
-    await update.message.reply_text("🧠 Persona updated")
-
-async def tone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("friendly / formal / casual")
-        return
-    user_tone[update.effective_chat.id] = " ".join(context.args)
-    await update.message.reply_text("🎭 Tone updated")
-
-async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /setmodel <name>")
-        return
-    context.user_data["model"] = " ".join(context.args)
-    await update.message.reply_text("✅ Model changed")
-
-# ───────────────────────── MAIN CHAT ───────────────────────── #
+# ───────────────────────── MAIN HANDLER ───────────────────────── #
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
+
     model = context.user_data.get("model", DEFAULT_MODEL)
 
-    # learning name
-    if "my name is" in text.lower():
-        user_profile[chat_id]["name"] = text.split("is")[-1].strip()
-
-    # rate limit
-    if is_rate_limited(chat_id):
-        await update.message.reply_text("⏱️ Slow down please")
-        return
-
-    # lock
+    # 🚫 BLOCK IF BUSY
     if user_locks[chat_id].locked():
         await update.message.reply_text("⏳ Wait, I am still replying...")
         return
@@ -213,61 +139,68 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages = build_messages(chat_id, text, model)
 
         buffer = ""
-        last = time.time()
+        last_update = time.time()
 
         loop = asyncio.get_event_loop()
+
         chunks = await loop.run_in_executor(
             None, lambda: list(stream_ai(messages, model))
         )
 
-        for c in chunks:
+        for chunk in chunks:
 
             if chat_id in user_stop:
                 user_stop.discard(chat_id)
                 await sent.edit_text("🛑 Stopped")
                 return
 
-            buffer += c
+            buffer += chunk
 
-            if time.time() - last > UPDATE_INTERVAL:
+            if time.time() - last_update > UPDATE_INTERVAL:
                 try:
                     await sent.edit_text(buffer[-3500:])
                 except:
                     pass
-                last = time.time()
+                last_update = time.time()
 
         await sent.edit_text(buffer[:4000])
-
         save(chat_id, text, buffer)
 
-# ───────────────────────── WEB SERVER ───────────────────────── #
+# ───────────────────────── WEB SERVER (RENDER FIX) ───────────────────────── #
 
-class H(BaseHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
 
+    def log_message(self, *args):
+        pass
+
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), H).serve_forever()
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    logger.info(f"Web server running on {port}")
+    server.serve_forever()
 
-# ───────────────────────── BOT RUN ───────────────────────── #
+# ───────────────────────── BOT START (FIXED) ───────────────────────── #
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("persona", persona))
-    app.add_handler(CommandHandler("tone", tone))
-    app.add_handler(CommandHandler("setmodel", setmodel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
 
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    await app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
 
-# ───────────────────────── ENTRY ───────────────────────── #
+    logger.info("Bot running...")
+
+    await asyncio.Event().wait()
+
+# ───────────────────────── ENTRYPOINT (FIXED FOR RENDER) ───────────────────────── #
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
