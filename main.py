@@ -20,7 +20,7 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
-DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
+DEFAULT_MODEL = "qwen3-next-80b-a3b-instruct"  # fast model
 
 # ---------------------------------------- #
 # 🧠 Agent
@@ -57,7 +57,6 @@ app = Flask(__name__)
 # ---------------------------------------- #
 
 _ptb_app = None
-_ptb_initialized = False
 
 
 def get_ptb_app():
@@ -79,7 +78,7 @@ def get_ptb_app():
 def get_models():
     headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}"}
     try:
-        res = requests.get(MODELS_URL, headers=headers, timeout=20)
+        res = requests.get(MODELS_URL, headers=headers, timeout=10)
         if res.status_code == 200:
             return [m["id"] for m in res.json().get("data", [])]
         return [f"API error {res.status_code}"]
@@ -95,11 +94,12 @@ def chat_with_nvidia(messages, model):
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 500,
+        "temperature": 0.6,
+        "max_tokens": 400,      # kam tokens = faster response
+        "top_p": 0.7,
     }
     try:
-        res = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+        res = requests.post(API_URL, headers=headers, json=payload, timeout=30)
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
         return f"API Error {res.status_code}: {res.text}"
@@ -113,6 +113,7 @@ def chat_with_nvidia(messages, model):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Bot ready!\n\n"
+        f"Model: {DEFAULT_MODEL}\n\n"
         "/models → list models\n"
         "/setmodel <n> → change model\n"
         "Try: calculate 5*10"
@@ -142,14 +143,19 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
+    # 🧠 Tool check
     tool_result = agent.think(user_text)
     if tool_result:
         await update.message.reply_text(f"🧮 {tool_result}")
         return
 
+    # Typing indicator
+    await update.message.chat.send_action("typing")
+
+    # 💾 Conversation history
     if "history" not in context.user_data:
         context.user_data["history"] = [
-            {"role": "system", "content": "You are a helpful AI assistant."}
+            {"role": "system", "content": "You are a fast, helpful AI assistant. Keep responses concise."}
         ]
 
     context.user_data["history"].append({"role": "user", "content": user_text})
