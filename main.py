@@ -33,23 +33,29 @@ MODEL = "openai/gpt-oss-120b"
 
 MAX_HISTORY = 20
 STREAM_TIMEOUT = 90
-UPDATE_INTERVAL = 0.5
 
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
     raise SystemExit("Missing API keys")
 
-# ───────────────── MEMORY (FIXED) ───────────────── #
+# ───────────────── MEMORY ───────────────── #
 
 conversation_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 user_locks = defaultdict(asyncio.Lock)
 user_stop = set()
 
+# ───────────────── SYSTEM PROMPT (PURE API MODE) ───────────────── #
+
 SYSTEM_PROMPT = """
 You are a highly intelligent AI assistant.
-Remember conversation context and respond naturally like a human.
+
+RULES:
+- Respond naturally based on user's input language
+- Do not force any language style
+- Do not over-explain unless asked
+- Be accurate, clear, and helpful
 """
 
-# ───────────────── STREAM AI (FIXED SAFE) ───────────────── #
+# ───────────────── STREAM AI ───────────────── #
 
 def stream_ai(messages):
     payload = {
@@ -83,8 +89,8 @@ def stream_ai(messages):
                         return
 
                     data = json.loads(line)
-
                     delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+
                     if delta:
                         yield delta
 
@@ -94,7 +100,7 @@ def stream_ai(messages):
     except Exception as e:
         yield f"Error: {e}"
 
-# ───────────────── MEMORY BUILDER (FIXED) ───────────────── #
+# ───────────────── MEMORY BUILD ───────────────── #
 
 def build_messages(chat_id, text):
     history = list(conversation_history[chat_id])
@@ -105,31 +111,29 @@ def build_messages(chat_id, text):
         + [{"role": "user", "content": text}]
     )
 
-# ───────────────── SAVE MEMORY (FIXED) ───────────────── #
+# ───────────────── SAVE MEMORY ───────────────── #
 
 def save(chat_id, user_text, bot_text):
     conversation_history[chat_id].append({"role": "user", "content": user_text})
     conversation_history[chat_id].append({"role": "assistant", "content": bot_text})
 
-# ───────────────── START ───────────────── #
+# ───────────────── COMMANDS ───────────────── #
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Stable Memory Agent Online")
-
-# ───────────────── STOP ───────────────── #
+    await update.message.reply_text("🤖 AI Agent Bot Online")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_stop.add(update.effective_chat.id)
-    await update.message.reply_text("🛑 Stopped")
+    await update.message.reply_text("🛑 Stopping response...")
 
-# ───────────────── MAIN HANDLER (FIXED MEMORY + STREAM) ───────────────── #
+# ───────────────── MAIN CHAT ───────────────── #
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
     if user_locks[chat_id].locked():
-        await update.message.reply_text("⏳ Wait, still replying...")
+        await update.message.reply_text("⏳ Please wait, I am still replying...")
         return
 
     async with user_locks[chat_id]:
@@ -151,24 +155,30 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await sent.edit_text("🛑 Stopped")
                 return
 
+            if not chunk:
+                continue
+
             buffer += chunk
 
-            # 🔥 SAFE UPDATE (NO BREAKING TEXT)
-            if time.time() - last_update > UPDATE_INTERVAL:
+            # stable update (no flicker / no half text issue)
+            if time.time() - last_update > 0.6:
                 try:
                     await sent.edit_text(buffer[:4000])
                 except:
                     pass
                 last_update = time.time()
 
-        # final output
-        if buffer.strip():
-            await sent.edit_text(buffer[:4000])
+        final_text = buffer.strip()
+
+        if final_text:
+            try:
+                await sent.edit_text(final_text[:4000])
+            except:
+                await update.message.reply_text(final_text[:4000])
         else:
             await sent.edit_text("⚠️ Empty response")
 
-        # 🧠 MEMORY SAVE (IMPORTANT FIX)
-        save(chat_id, text, buffer)
+        save(chat_id, text, final_text)
 
 # ───────────────── WEB SERVER (RENDER SAFE) ───────────────── #
 
@@ -198,10 +208,10 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    logger.info("Bot Running with Memory + Stable Stream")
+    logger.info("Bot running (stable production mode)")
     await asyncio.Event().wait()
 
-# ───────────────── ENTRY ───────────────── #
+# ───────────────── ENTRYPOINT ───────────────── #
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
