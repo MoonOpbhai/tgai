@@ -23,7 +23,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_KEY = os.getenv("NVIDIA_API_KEY")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-MODEL = "moonshotai/kimi-k2-instruct"
+MODEL = "z-ai/glm-5.1"
 
 # ───────────────── MEMORY ───────────────── #
 
