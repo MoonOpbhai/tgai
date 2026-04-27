@@ -12,7 +12,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -30,7 +30,6 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
-
 DB_FILE = "memory.db"
 
 if not TELEGRAM_BOT_TOKEN or not NVIDIA_API_KEY:
@@ -133,7 +132,7 @@ Formatting:
 Use **bold** for important words when useful.
 Use `inline code` for short commands, filenames, variables, model names, errors, and APIs.
 Use fenced code blocks for full code, terminal commands, JSON, Python, Bash, JavaScript, HTML, CSS, etc.
-Correct code block means: three backticks, language name, code, then three backticks.
+Correct code block means three backticks, language name, code, then three backticks.
 Never write only the language name before code.
 Do not use ### headings unless the user asks for documentation.
 
@@ -151,7 +150,7 @@ def detect_language_instruction(text):
     english_letters = len(re.findall(r"[A-Za-z]", text))
 
     hinglish_words = len(re.findall(
-        r"\b(kya|hai|hain|nhi|nahin|kaise|kese|kar|karo|kr|mujhe|tum|aap|bhai|bata|bolo|hona|chahiye|thek|sahi|galat|code|vps|wala|wasa|aisa|kaam|fix|de|do|mat|kyu|kyun|abhi|isme|usme|ye|wo|jo|jaisa|waisa|bana|banake|denge|chala|chalana|normal|bar|baar)\b",
+        r"\b(kya|hai|hain|nhi|nahin|kaise|kese|kar|karo|kr|mujhe|tum|aap|bhai|bata|bolo|hona|chahiye|thek|sahi|galat|code|vps|wala|wasa|aisa|kaam|fix|de|do|mat|kyu|kyun|abhi|isme|usme|ye|wo|jo|jaisa|waisa|bana|banake|denge|chala|chalana|normal|bar|baar|typing|indicator)\b",
         text_l
     ))
 
@@ -218,12 +217,6 @@ def plain_cleanup(text):
 
     return text.strip()
 
-def safe_raw_tail(text, limit=3800):
-    text = text or ""
-    if len(text) <= limit:
-        return text
-    return text[-limit:]
-
 def apply_inline_markdown(segment):
     segment = html.escape(segment)
 
@@ -271,14 +264,35 @@ def markdown_to_telegram_html(text):
     out = re.sub(r"\n{5,}", "\n\n\n", out)
     return out.strip()
 
-def stream_ai(messages, model):
+def split_text(text, limit=3900):
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    for part in text.split("\n"):
+        if len(current) + len(part) + 1 <= limit:
+            current += part + "\n"
+        else:
+            if current.strip():
+                chunks.append(current.strip())
+            current = part + "\n"
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks or [text[:limit]]
+
+def call_ai_sync(messages, model):
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0.35,
         "top_p": 0.85,
         "max_tokens": 1400,
-        "stream": True,
+        "stream": False,
     }
 
     headers = {
@@ -287,43 +301,21 @@ def stream_ai(messages, model):
     }
 
     try:
-        with requests.post(
+        r = requests.post(
             API_URL,
             json=payload,
             headers=headers,
-            stream=True,
             timeout=120
-        ) as r:
+        )
 
-            if r.status_code != 200:
-                yield f"API Error {r.status_code}: {r.text[:700]}"
-                return
+        if r.status_code != 200:
+            return f"API Error {r.status_code}: {r.text[:700]}"
 
-            for line in r.iter_lines():
-                if not line:
-                    continue
-
-                line = line.decode("utf-8", errors="ignore").strip()
-
-                if not line.startswith("data:"):
-                    continue
-
-                line = line[5:].strip()
-
-                if line == "[DONE]":
-                    break
-
-                try:
-                    data = json.loads(line)
-                    delta = data.get("choices", [{}])[0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        yield content
-                except Exception:
-                    continue
+        data = r.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
     except Exception as e:
-        yield f"Stream Error: {e}"
+        return f"API Error: {e}"
 
 def build_messages(chat_id, text):
     history = get_history(chat_id)
@@ -339,6 +331,18 @@ def build_messages(chat_id, text):
     ] + history + [
         {"role": "user", "content": text}
     ]
+
+async def send_typing_loop(context, chat_id, stop_event):
+    while not stop_event.is_set():
+        try:
+            await context.bot.send_chat_action(
+                chat_id=chat_id,
+                action=ChatAction.TYPING
+            )
+        except Exception as e:
+            logger.warning(f"Typing action failed: {e}")
+
+        await asyncio.sleep(4)
 
 async def edit_telegram_text(message_obj, raw_text, formatted=True):
     raw_text = plain_cleanup(raw_text)
@@ -394,41 +398,46 @@ async def send_telegram_text(update, text, formatted=True):
         disable_web_page_preview=True
     )
 
-async def smooth_stream(message_obj, generator, chat_id):
-    buffer = ""
-    last_update = 0
-    update_delay = 1.2
-
-    for chunk in generator:
-        if chat_id in user_stop:
-            user_stop.discard(chat_id)
-            await edit_telegram_text(message_obj, "Stopped.", formatted=False)
-            return None
-
-        buffer += chunk
-
-        if time.time() - last_update > update_delay:
-            preview = plain_cleanup(safe_raw_tail(buffer, limit=3600))
-
-            try:
-                await message_obj.edit_text(
-                    preview[:3900],
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                logger.warning(f"Streaming preview failed: {e}")
-
-            last_update = time.time()
-
-    final = plain_cleanup(buffer)
+async def send_final_response(sent, update, final):
+    final = plain_cleanup(final)
 
     if not final:
         final = "Empty response mila."
 
-    await asyncio.sleep(0.4)
+    chunks = split_text(final, 3900)
 
-    await edit_telegram_text(message_obj, final, formatted=True)
-    return final
+    first = True
+
+    for chunk in chunks:
+        html_text = markdown_to_telegram_html(chunk)
+
+        if first:
+            try:
+                await sent.edit_text(
+                    html_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.warning(f"Final formatted edit failed: {e}")
+                await sent.edit_text(
+                    chunk[:3900],
+                    disable_web_page_preview=True
+                )
+            first = False
+        else:
+            try:
+                await update.message.reply_text(
+                    html_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.warning(f"Final formatted send chunk failed: {e}")
+                await update.message.reply_text(
+                    chunk[:3900],
+                    disable_web_page_preview=True
+                )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_telegram_text(update, "**Bot online.** Message bhejo.")
@@ -487,22 +496,33 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with user_lock[chat_id]:
-        sent = await update.message.reply_text("Thinking...")
+        sent = await update.message.reply_text("...")
 
         model = user_model.get(chat_id) or get_saved_model(chat_id)
         user_model[chat_id] = model
 
         messages = build_messages(chat_id, text)
 
-        gen = stream_ai(messages, model)
-        final = await smooth_stream(sent, gen, chat_id)
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_event))
 
-        if not final:
-            final = "Empty response mila."
+        try:
+            final = await asyncio.to_thread(call_ai_sync, messages, model)
+        finally:
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+        if chat_id in user_stop:
+            user_stop.discard(chat_id)
+            await edit_telegram_text(sent, "Stopped.", formatted=False)
+            return
 
         final = plain_cleanup(final)
 
-        await edit_telegram_text(sent, final, formatted=True)
+        await send_final_response(sent, update, final)
 
         save_msg(chat_id, "user", text)
         save_msg(chat_id, "assistant", final)
