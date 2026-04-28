@@ -701,4 +701,19 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("reset", res
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("approve", approve))
+    app.add_handler(CommandHandler("unapprove", unapprove))
+    app.add_handler(CommandHandler("setmodel", setmodel))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    logger.info("Bot running...")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
+    asyncio.run(main())
