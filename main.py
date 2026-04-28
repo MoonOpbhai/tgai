@@ -30,7 +30,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or "0")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"
+DEFAULT_MODEL = "mistral-large-3-675b-instruct-2512"
 DB_FILE = "memory.db"
 MAX_CONTEXT_MESSAGES = 100
 
