@@ -130,6 +130,13 @@ def approve_user(user_id, approved_by):
     )
     conn.commit()
 
+def unapprove_user(user_id):
+    cursor.execute(
+        "DELETE FROM approved_users WHERE user_id=?",
+        (str(user_id),)
+    )
+    conn.commit()
+
 def is_owner(user_id):
     return int(user_id) == OWNER_ID
 
@@ -146,6 +153,7 @@ def is_approved(user_id):
 user_model = defaultdict(lambda: DEFAULT_MODEL)
 user_lock = defaultdict(asyncio.Lock)
 user_stop = set()
+api_lock = threading.Lock()
 
 SYSTEM_PROMPT = r'''
 You are a smart, calm, agentic AI assistant.
@@ -347,7 +355,7 @@ def call_ai_sync(messages, model):
         "messages": messages,
         "temperature": 0.35,
         "top_p": 0.85,
-        "max_tokens": 1400,
+        "max_tokens": 1000,
         "stream": False,
     }
 
@@ -356,22 +364,59 @@ def call_ai_sync(messages, model):
         "Content-Type": "application/json",
     }
 
-    try:
-        r = requests.post(
-            API_URL,
-            json=payload,
-            headers=headers,
-            timeout=120
-        )
+    retry_waits = [3, 6, 12, 20]
 
-        if r.status_code != 200:
-            return f"API Error {r.status_code}: {r.text[:700]}"
+    with api_lock:
+        for attempt, wait_time in enumerate(retry_waits, start=1):
+            try:
+                r = requests.post(
+                    API_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=120
+                )
 
-        data = r.json()
-        return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                if r.status_code == 200:
+                    data = r.json()
+                    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
-    except Exception as e:
-        return f"API Error: {e}"
+                if r.status_code == 429:
+                    logger.warning(f"NVIDIA 429 rate limit. Attempt {attempt}/{len(retry_waits)}")
+
+                    if attempt < len(retry_waits):
+                        time.sleep(wait_time)
+                        continue
+
+                    return (
+                        "NVIDIA API abhi rate limit de raha hai. "
+                        "Thoda ruk ke dobara try karo. Agar baar-baar aaye to lighter model use karo: "
+                        "`/setmodel mistralai/mistral-small-4-119b-2603`"
+                    )
+
+                if r.status_code in (500, 502, 503, 504):
+                    logger.warning(f"NVIDIA server error {r.status_code}. Attempt {attempt}/{len(retry_waits)}")
+
+                    if attempt < len(retry_waits):
+                        time.sleep(wait_time)
+                        continue
+
+                    return f"NVIDIA API server busy hai. Error {r.status_code}. Thoda baad try karo."
+
+                return f"API Error {r.status_code}: {r.text[:700]}"
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"NVIDIA timeout. Attempt {attempt}/{len(retry_waits)}")
+
+                if attempt < len(retry_waits):
+                    time.sleep(wait_time)
+                    continue
+
+                return "API timeout ho gaya. Thoda baad dobara try karo."
+
+            except Exception as e:
+                return f"API Error: {e}"
+
+    return "API busy hai. Thoda baad dobara try karo."
 
 def build_messages(chat_id, text):
     history = get_history(chat_id)
@@ -545,6 +590,30 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     approve_user(target_id, user_id)
     await send_telegram_text(update, f"Approved:\n`{target_id}`")
 
+async def unapprove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_owner(user_id):
+        await update.message.reply_text("Owner only.")
+        return
+
+    if not context.args:
+        await send_telegram_text(update, "Usage: `/unapprove user_id`")
+        return
+
+    target_id = context.args[0].strip()
+
+    if not target_id.isdigit():
+        await update.message.reply_text("Invalid user id.")
+        return
+
+    if int(target_id) == OWNER_ID:
+        await update.message.reply_text("Owner ko unapprove nahi kar sakte.")
+        return
+
+    unapprove_user(target_id)
+    await send_telegram_text(update, f"Unapproved:\n`{target_id}`")
+
 async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -632,18 +701,4 @@ async def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("approve", approve))
-    app.add_handler(CommandHandler("setmodel", setmodel))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-
-    logger.info("Bot running...")
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    threading.Thread(target=run_web, daemon=True).start()
-    asyncio.run(main())
+    app.add_handler(CommandHandler("reset", res
