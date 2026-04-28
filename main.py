@@ -30,7 +30,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or "0")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-DEFAULT_MODEL = "google/gemma-3-27b-it"
+DEFAULT_MODEL = "gemma-4-31b-it"
 DB_FILE = "memory.db"
 MAX_CONTEXT_MESSAGES = 50
 
