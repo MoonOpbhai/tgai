@@ -506,9 +506,9 @@ def call_ai_sync(messages, model):
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.35,
-        "top_p": 0.85,
-        "max_tokens": 1500,
+        "temperature": 0.6,
+        "top_p": 0.9,
+        "max_tokens": 14096,
         "stream": False,
     }
     headers = {
