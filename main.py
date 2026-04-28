@@ -506,10 +506,10 @@ def call_ai_sync(messages, model):
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 1,
-        "top_p": 1,
-        "max_tokens": 16384,
-        "stream": True,
+        "temperature": 0.6,
+        "top_p": 0.7,
+        "max_tokens": 4096,
+        "stream": False,
     }
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
