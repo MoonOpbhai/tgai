@@ -30,7 +30,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or "0")
 
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-DEFAULT_MODEL = "moonshotai/kimi-k2-instruct-0905"
+DEFAULT_MODEL = "z-ai/glm4.7"
 DB_FILE = "memory.db"
 MAX_CONTEXT_MESSAGES = 50
 
@@ -506,9 +506,9 @@ def call_ai_sync(messages, model):
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.6,
-        "top_p": 0.9,
-        "max_tokens": 4096,
+        "temperature": 1,
+        "top_p": 1,
+        "max_tokens": 16384,
         "stream": True,
     }
     headers = {
