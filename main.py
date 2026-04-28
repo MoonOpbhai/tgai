@@ -8,8 +8,12 @@ import logging
 import sqlite3
 import re
 import html
+import base64
+import tempfile
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from openai import OpenAI
 
 from telegram import Update
 from telegram.constants import ParseMode, ChatAction
@@ -21,6 +25,19 @@ from telegram.ext import (
     filters,
 )
 
+# Optional imports — bot gracefully handles if not installed
+try:
+    import fitz  # PyMuPDF: pip install pymupdf
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
+
+try:
+    from docx import Document as DocxDocument  # pip install python-docx
+    DOCX_SUPPORT = True
+except ImportError:
+    DOCX_SUPPORT = False
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Bot")
 
@@ -28,11 +45,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or "0")
 
-API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-
-DEFAULT_MODEL = "z-ai/glm4.7"
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+DEFAULT_MODEL = "moonshotai/kimi-k2-instruct-0905"
 DB_FILE = "memory.db"
-MAX_CONTEXT_MESSAGES = 50
+MAX_CONTEXT_MESSAGES = 100
+
+# OpenAI-compatible client for NVIDIA NIM
+nim_client = OpenAI(
+    base_url=NVIDIA_BASE_URL,
+    api_key=NVIDIA_API_KEY,
+)
 
 # GitHub raw base URL for antigravity-awesome-skills
 SKILLS_GITHUB_BASE = "https://raw.githubusercontent.com/sickn33/antigravity-awesome-skills/main/skills"
@@ -503,51 +525,68 @@ user_stop = set()
 api_lock = threading.Lock()
 
 def call_ai_sync(messages, model):
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.6,
-        "top_p": 0.7,
-        "max_tokens": 4096,
-        "stream": False,
-    }
-    headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    """Call NVIDIA NIM via OpenAI-compatible client with streaming."""
     retry_waits = [3, 6, 12, 20]
     with api_lock:
         for attempt, wait_time in enumerate(retry_waits, start=1):
             try:
-                r = requests.post(API_URL, json=payload, headers=headers, timeout=120)
-                if r.status_code == 200:
-                    data = r.json()
-                    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                if r.status_code == 429:
-                    logger.warning(f"NVIDIA 429 rate limit. Attempt {attempt}/{len(retry_waits)}")
+                completion = nim_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.6,
+                    top_p=0.9,
+                    max_tokens=4096,
+                    stream=True,
+                )
+                result = ""
+                for chunk in completion:
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    delta = chunk.choices[0].delta
+                    if getattr(delta, "content", None):
+                        result += delta.content
+
+                if result.strip():
+                    return result.strip()
+
+                # Empty result — retry
+                logger.warning(f"Empty stream response. Attempt {attempt}/{len(retry_waits)}")
+                if attempt < len(retry_waits):
+                    time.sleep(wait_time)
+                    continue
+                return "NVIDIA ne empty response diya. Model change karo ya baad mein try karo."
+
+            except Exception as e:
+                err_str = str(e)
+                logger.warning(f"API error attempt {attempt}: {err_str}")
+
+                # Rate limit
+                if "429" in err_str or "rate" in err_str.lower():
                     if attempt < len(retry_waits):
                         time.sleep(wait_time)
                         continue
                     return (
-                        "NVIDIA API abhi rate limit de raha hai. "
-                        "Thoda ruk ke dobara try karo. Agar baar-baar aaye to lighter model use karo: "
-                        "`/setmodel mistralai/mistral-small-4-119b-2603`"
+                        "NVIDIA rate limit lag gayi. Thoda ruk ke try karo.\n"
+                        "Lighter model ke liye: `/setmodel meta/llama-3.3-70b-instruct`"
                     )
-                if r.status_code in (500, 502, 503, 504):
-                    logger.warning(f"NVIDIA server error {r.status_code}. Attempt {attempt}/{len(retry_waits)}")
+
+                # Server errors — retry
+                if any(x in err_str for x in ["500", "502", "503", "504"]):
                     if attempt < len(retry_waits):
                         time.sleep(wait_time)
                         continue
-                    return f"NVIDIA API server busy hai. Error {r.status_code}. Thoda baad try karo."
-                return f"API Error {r.status_code}: {r.text[:700]}"
-            except requests.exceptions.Timeout:
-                logger.warning(f"NVIDIA timeout. Attempt {attempt}/{len(retry_waits)}")
-                if attempt < len(retry_waits):
-                    time.sleep(wait_time)
-                    continue
-                return "API timeout ho gaya. Thoda baad dobara try karo."
-            except Exception as e:
-                return f"API Error: {e}"
+                    return f"NVIDIA server error. Thoda baad try karo."
+
+                # Timeout
+                if "timeout" in err_str.lower() or "timed out" in err_str.lower():
+                    if attempt < len(retry_waits):
+                        time.sleep(wait_time)
+                        continue
+                    return "API timeout. Thoda baad try karo."
+
+                # Non-retryable
+                return f"API Error: {err_str[:300]}"
+
     return "API busy hai. Thoda baad dobara try karo."
 
 def build_messages(chat_id, text):
@@ -654,7 +693,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Access denied.\nYour user id: {user_id}\nAsk owner to approve you."
         )
         return
-    await send_telegram_text(update, "**Bot online.** Message bhejo.\n\nSkills ke liye `/skills` dekho.")
+    await send_telegram_text(update,
+        "**Bot online.**\n\n"
+        "**Kya bhej sakte ho:**\n"
+        "• Text message — normal chat\n"
+        "• Photo / image — vision model se analyze hogi\n"
+        "• `.txt`, `.py`, `.js`, `.json`, `.md` — code/text files\n"
+        "• `.pdf` — PDF extract + analyze\n"
+        "• `.docx` — Word doc extract + analyze\n\n"
+        "**Commands:**\n"
+        "`/skills` — available skills list\n"
+        "`/skill react` — skill activate karo\n"
+        "`/setmodel model_name` — model change karo\n"
+        "`/reset` — memory clear\n"
+        "`/stop` — response rok do"
+    )
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -794,18 +847,114 @@ async def skills_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chunk in chunks:
         await send_telegram_text(update, chunk)
 
+# ─────────────────────────────────────────────
+# Vision models on NVIDIA NIM
+# ─────────────────────────────────────────────
+
+VISION_MODELS = {
+    "meta/llama-3.2-11b-vision-instruct",
+    "meta/llama-3.2-90b-vision-instruct",
+    "microsoft/phi-3.5-vision-instruct",
+    "google/gemma-3-27b-it",
+    "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+}
+
+def is_vision_model(model: str) -> bool:
+    return model in VISION_MODELS
+
+# ─────────────────────────────────────────────
+# File extraction helpers
+# ─────────────────────────────────────────────
+
+def extract_txt(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception as e:
+        return f"[TXT read error: {e}]"
+
+def extract_pdf(path: str) -> str:
+    if not PDF_SUPPORT:
+        return "[PDF support nahi hai. VPS pe chalao: pip install pymupdf]"
+    try:
+        doc = fitz.open(path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        return text.strip() or "[PDF mein koi text nahi mila]"
+    except Exception as e:
+        return f"[PDF read error: {e}]"
+
+def extract_docx(path: str) -> str:
+    if not DOCX_SUPPORT:
+        return "[DOCX support nahi hai. VPS pe chalao: pip install python-docx]"
+    try:
+        doc = DocxDocument(path)
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip()) or "[DOCX mein koi text nahi mila]"
+    except Exception as e:
+        return f"[DOCX read error: {e}]"
+
+def file_to_base64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+def get_image_mime(filename: str) -> str:
+    ext = filename.lower().rsplit(".", 1)[-1]
+    return {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp", "gif": "image/gif"}.get(ext, "image/jpeg")
+
+# ─────────────────────────────────────────────
+# Vision API call (image → NIM VLM)
+# ─────────────────────────────────────────────
+
+def call_vision_sync(messages, model):
+    """Call NVIDIA NIM vision model via OpenAI client."""
+    try:
+        completion = nim_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.6,
+            top_p=0.9,
+            max_tokens=2048,
+            stream=True,
+        )
+        result = ""
+        for chunk in completion:
+            if not getattr(chunk, "choices", None):
+                continue
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None):
+                result += delta.content
+        return result.strip() or "Vision model ne empty response diya."
+    except Exception as e:
+        return f"Vision API Error: {e}"
+
+# ─────────────────────────────────────────────
+# Unified message handler (text + files + images)
+# ─────────────────────────────────────────────
+
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    text = (update.message.text or "").strip()
+    msg = update.message
 
     if not is_approved(user_id):
-        await update.message.reply_text(
+        await msg.reply_text(
             f"Access denied.\nYour user id: {user_id}\nAsk owner to approve you."
         )
         return
 
-    if not text:
+    # ── Determine what was sent ──────────────────
+    text = (msg.text or msg.caption or "").strip()
+    photo = msg.photo
+    document = msg.document
+    voice = msg.voice
+    audio = msg.audio
+    video = msg.video
+    sticker = msg.sticker
+
+    # Nothing useful
+    if not text and not photo and not document and not voice and not audio and not video:
         return
 
     if user_lock[chat_id].locked():
@@ -813,18 +962,118 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with user_lock[chat_id]:
-        sent = await update.message.reply_text("...")
-
+        sent = await msg.reply_text("...")
         model = user_model.get(chat_id) or get_saved_model(chat_id)
         user_model[chat_id] = model
 
-        messages = build_messages(chat_id, text)
-
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_event))
+        final = ""
 
         try:
-            final = await asyncio.to_thread(call_ai_sync, messages, model)
+            # ── PHOTO / IMAGE ────────────────────────────
+            if photo:
+                vision_model = "meta/llama-3.2-11b-vision-instruct"
+                caption = text or "Is image mein kya hai? Describe karo."
+
+                photo_file = await photo[-1].get_file()
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    await photo_file.download_to_drive(tmp.name)
+                    img_b64 = await asyncio.to_thread(file_to_base64, tmp.name)
+                    os.unlink(tmp.name)
+
+                mime = "image/jpeg"
+                vision_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+                            {"type": "text", "text": caption},
+                        ]
+                    }
+                ]
+                final = await asyncio.to_thread(call_vision_sync, vision_messages, vision_model)
+
+            # ── DOCUMENT / FILE ──────────────────────────
+            elif document:
+                fname = document.file_name or ""
+                ext = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
+                caption = text or ""
+
+                doc_file = await document.get_file()
+                with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+                    tmp_path = tmp.name
+
+                await doc_file.download_to_drive(tmp_path)
+
+                try:
+                    # Image file sent as document
+                    if ext in ("jpg", "jpeg", "png", "webp", "gif"):
+                        vision_model = "meta/llama-3.2-11b-vision-instruct"
+                        caption = caption or "Is image mein kya hai? Describe karo."
+                        img_b64 = await asyncio.to_thread(file_to_base64, tmp_path)
+                        mime = get_image_mime(fname)
+                        vision_messages = [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+                                    {"type": "text", "text": caption},
+                                ]
+                            }
+                        ]
+                        final = await asyncio.to_thread(call_vision_sync, vision_messages, vision_model)
+
+                    # PDF
+                    elif ext == "pdf":
+                        file_text = await asyncio.to_thread(extract_pdf, tmp_path)
+                        file_text = file_text[:12000]
+                        prompt = caption if caption else "Is document ko summarize karo aur important points batao."
+                        combined = f"[PDF File: {fname}]\n\n{file_text}\n\n---\nUser request: {prompt}"
+                        messages = build_messages(chat_id, combined)
+                        final = await asyncio.to_thread(call_ai_sync, messages, model)
+
+                    # DOCX
+                    elif ext == "docx":
+                        file_text = await asyncio.to_thread(extract_docx, tmp_path)
+                        file_text = file_text[:12000]
+                        prompt = caption if caption else "Is document ko summarize karo."
+                        combined = f"[DOCX File: {fname}]\n\n{file_text}\n\n---\nUser request: {prompt}"
+                        messages = build_messages(chat_id, combined)
+                        final = await asyncio.to_thread(call_ai_sync, messages, model)
+
+                    # TXT / code files
+                    elif ext in ("txt", "py", "js", "ts", "jsx", "tsx", "json", "yaml", "yml", "md", "html", "css", "sh", "env", "toml", "ini", "xml", "csv", "log"):
+                        file_text = await asyncio.to_thread(extract_txt, tmp_path)
+                        file_text = file_text[:12000]
+                        prompt = caption if caption else f"Is {ext.upper()} file ko analyze karo."
+                        combined = f"[File: {fname}]\n\n```{ext}\n{file_text}\n```\n\n---\nUser request: {prompt}"
+                        messages = build_messages(chat_id, combined)
+                        final = await asyncio.to_thread(call_ai_sync, messages, model)
+
+                    # Unsupported
+                    else:
+                        final = f"File type `.{ext}` abhi support nahi hai.\n\nSupported: `txt`, `py`, `js`, `ts`, `json`, `yaml`, `md`, `html`, `css`, `sh`, `pdf`, `docx`, images (`jpg`, `png`, `webp`)"
+
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+
+            # ── VOICE / AUDIO ────────────────────────────
+            elif voice or audio:
+                final = "Voice/Audio messages abhi support nahi hain. Text mein likhke bhejo."
+
+            # ── PLAIN TEXT ───────────────────────────────
+            else:
+                if not text:
+                    return
+                messages = build_messages(chat_id, text)
+                final = await asyncio.to_thread(call_ai_sync, messages, model)
+
         finally:
             stop_event.set()
             try:
@@ -837,10 +1086,12 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit_telegram_text(sent, "Stopped.", formatted=False)
             return
 
-        final = plain_cleanup(final)
+        final = plain_cleanup(final) if final else "Koi response nahi mila."
         await send_final_response(sent, update, final)
 
-        save_msg(chat_id, "user", text)
+        # Save to history (only text interactions)
+        user_text = text or f"[File: {document.file_name if document else 'image'}]"
+        save_msg(chat_id, "user", user_text)
         save_msg(chat_id, "assistant", final)
 
 # ─────────────────────────────────────────────
@@ -875,13 +1126,21 @@ async def main():
     app.add_handler(CommandHandler("setmodel", setmodel))
     app.add_handler(CommandHandler("skill", skill_cmd))
     app.add_handler(CommandHandler("skills", skills_list))
+
+    # Text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    # Photos
+    app.add_handler(MessageHandler(filters.PHOTO, handle))
+    # Documents (PDF, DOCX, TXT, code files, images sent as files)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle))
+    # Voice
+    app.add_handler(MessageHandler(filters.VOICE, handle))
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    logger.info("Bot running with Skills support...")
+    logger.info("Bot running — text, files, images supported!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
